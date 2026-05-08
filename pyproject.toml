@@ -20,6 +20,9 @@ test = ["pytest>=8"]
 [tool.setuptools.packages.find]
 where = ["src"]
 
+[project.entry-points."vllm.general_plugins"]
+ds4_hybrid_iq2 = "ds4_hybrid_quant.vllm_patches:register_plugin"
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-ra -q"

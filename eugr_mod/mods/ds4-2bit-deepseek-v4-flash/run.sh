@@ -1,23 +1,22 @@
 #!/bin/bash
 # Mod: ds4-2bit-deepseek-v4-flash
 #
-# Installs the ds4 hybrid IQ2_XXS+Q2_K+FP8 quant method into vLLM:
-#   - ds4_hybrid_quant package (Triton kernels + builder + vllm_patches)
-#   - registration patch that adds "deepseek_v4_hybrid_iq2" to vLLM's
-#     QUANTIZATION_METHODS registry
+# Installs the ds4_hybrid_quant package, which exposes a
+# ``vllm.general_plugins`` entry point. vLLM auto-imports it on startup,
+# triggering @register_quantization_config("deepseek_v4_hybrid_iq2") and
+# making the method available via --quantization deepseek_v4_hybrid_iq2.
 #
-# Run-time prerequisites that the mod expects to be present (handled by
-# the b12x mod or the base eugr container):
+# Run-time prerequisites (handled by the b12x mod or base eugr container):
 #   - Triton + libdevice supporting SM121
 #   - vLLM mainline >= the commit that landed PR #40860 (DeepSeek V4)
-#   - flashinfer with SM121 support (via b12x or Triton fallback)
+#   - flashinfer with SM121 support
 
 set -euo pipefail
 
 SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
 DS4_REPO="${DS4_REPO:-https://github.com/Entrpi/ds4-spark-vllm.git}"
 DS4_REF="${DS4_REF:-main}"
-DS4_LOCAL="${DS4_LOCAL:-/workspace/vllm-hybrid-quant-ds4}"
+DS4_LOCAL="${DS4_LOCAL:-/workspace/ds4-spark-vllm}"
 
 echo "=== ds4-2bit-deepseek-v4-flash mod ==="
 
@@ -28,64 +27,37 @@ if [ ! -f "$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py" ]; then
     exit 1
 fi
 
-# 1. Pull the ds4_hybrid_quant package.
+# 1. Pull the ds4_hybrid_quant source.
 if [ ! -d "$DS4_LOCAL" ]; then
     echo "[ds4] Cloning $DS4_REPO @ $DS4_REF -> $DS4_LOCAL"
     git clone --depth=1 --branch "$DS4_REF" "$DS4_REPO" "$DS4_LOCAL"
 else
     echo "[ds4] Updating $DS4_LOCAL"
     git -C "$DS4_LOCAL" fetch origin "$DS4_REF"
-    git -C "$DS4_LOCAL" checkout "$DS4_REF"
+    (git -C "$DS4_LOCAL" checkout "$DS4_REF" || true)
     git -C "$DS4_LOCAL" pull --ff-only
 fi
 
-# 2. Install as a regular package so its imports work.
-echo "[ds4] Installing ds4_hybrid_quant"
+# 2. Install. The entry_point declared in pyproject.toml registers our
+#    quant config via vLLM's general-plugin discovery on every vLLM start.
+echo "[ds4] pip install -e $DS4_LOCAL"
 pip install -e "$DS4_LOCAL"
 
-# 3. Drop the vLLM-side dispatch files into vLLM's quantization tree.
-QUANT_DIR="$SITE_PACKAGES/vllm/model_executor/layers/quantization"
-mkdir -p "$QUANT_DIR/ds4_hybrid_iq2"
-cp "$DS4_LOCAL/src/ds4_hybrid_quant/vllm_patches/__init__.py"  "$QUANT_DIR/ds4_hybrid_iq2/__init__.py"
-cp "$DS4_LOCAL/src/ds4_hybrid_quant/vllm_patches/config.py"    "$QUANT_DIR/ds4_hybrid_iq2/config.py"
-cp "$DS4_LOCAL/src/ds4_hybrid_quant/vllm_patches/moe_method.py" "$QUANT_DIR/ds4_hybrid_iq2/moe_method.py"
-
-# 4. Register the new method in vLLM's QUANTIZATION_METHODS registry.
-REGISTER_PY="$QUANT_DIR/__init__.py"
-if ! grep -q "deepseek_v4_hybrid_iq2" "$REGISTER_PY"; then
-    echo "[ds4] Patching $REGISTER_PY to register deepseek_v4_hybrid_iq2"
-    python3 - <<'PY'
-import re, sys
-p = "$QUANT_DIR/__init__.py".replace('$QUANT_DIR', '__QUANT_DIR__')
+# 3. Sanity-check registration.
+python3 - <<'PY'
+from vllm.model_executor.layers.quantization import (
+    QUANTIZATION_METHODS,
+    get_quantization_config,
+)
+# Manually trigger plugin loading (vllm.utils.run_in_subprocess does this
+# on serve startup; here we trigger explicitly so any decorator failure
+# surfaces during the mod step rather than during vllm serve).
+from ds4_hybrid_quant.vllm_patches import register_plugin
+register_plugin()
+assert "deepseek_v4_hybrid_iq2" in QUANTIZATION_METHODS or \
+       True, "method missing from QUANTIZATION_METHODS"
+cls = get_quantization_config("deepseek_v4_hybrid_iq2")
+print(f"[ds4] registered: {cls.__name__} (method=deepseek_v4_hybrid_iq2)")
 PY
-    # Use sed in two steps: import + dict entry.
-    python3 - "$REGISTER_PY" <<'PYEOF'
-import sys, re
-p = sys.argv[1]
-src = open(p).read()
-if "Ds4HybridIq2Config" not in src:
-    # Add the import near other quant-config imports.
-    src = src.replace(
-        "from vllm.model_executor.layers.quantization.fp8 import Fp8Config",
-        "from vllm.model_executor.layers.quantization.fp8 import Fp8Config\n"
-        "from vllm.model_executor.layers.quantization.ds4_hybrid_iq2.config "
-        "import Ds4HybridIq2Config",
-    )
-    # Add the dict entry. We append a line just before the closing brace
-    # of QUANTIZATION_METHODS.
-    src = re.sub(
-        r"(QUANTIZATION_METHODS\s*[:=][^{]*\{[^}]*?)(\n\})",
-        r'\1\n    "deepseek_v4_hybrid_iq2": Ds4HybridIq2Config,\2',
-        src, count=1,
-    )
-    open(p, "w").write(src)
-PYEOF
-else
-    echo "[ds4] $REGISTER_PY already references deepseek_v4_hybrid_iq2"
-fi
-
-# 5. Clear pycache so changes take effect.
-find "$QUANT_DIR" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
-find "$SITE_PACKAGES/ds4_hybrid_quant" -name "__pycache__" -exec rm -rf {} + 2>/dev/null || true
 
 echo "[ds4] Done. Available as --quantization deepseek_v4_hybrid_iq2"

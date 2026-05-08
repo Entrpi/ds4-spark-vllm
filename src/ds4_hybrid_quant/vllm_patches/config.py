@@ -18,6 +18,7 @@ try:
     import torch
     from vllm.model_executor.layers.fused_moe import FusedMoE
     from vllm.model_executor.layers.linear import LinearBase, UnquantizedLinearMethod
+    from vllm.model_executor.layers.quantization import register_quantization_config
     from vllm.model_executor.layers.quantization.base_config import (
         QuantizationConfig,
         QuantizeMethodBase,
@@ -28,6 +29,10 @@ try:
 except ImportError:  # pragma: no cover - dev path without vLLM installed
     HAVE_VLLM = False
     QuantizationConfig = object  # type: ignore[assignment]
+    def register_quantization_config(name):  # type: ignore[no-redef]
+        def _decorator(cls):
+            return cls
+        return _decorator
 
 if TYPE_CHECKING:  # pragma: no cover
     from vllm.config import VllmConfig
@@ -37,6 +42,7 @@ if TYPE_CHECKING:  # pragma: no cover
 _QUANT_METHOD_NAME = "deepseek_v4_hybrid_iq2"
 
 
+@register_quantization_config(_QUANT_METHOD_NAME)
 class Ds4HybridIq2Config(QuantizationConfig):
     """Hybrid 2-bit-experts + FP8-dense quantization for DeepSeek V4 Flash.
 
