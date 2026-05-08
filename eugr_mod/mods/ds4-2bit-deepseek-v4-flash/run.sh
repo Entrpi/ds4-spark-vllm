@@ -37,10 +37,13 @@ if ! python3 -c "import deep_gemm" 2>/dev/null; then
     if [ ! -d "$DG_LOCAL" ]; then
         git clone --depth=1 https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
     fi
-    # --no-build-isolation: DeepGEMM's setup.py imports torch, which isn't
-    # available in pep517's isolated build env. Use the container's
-    # already-installed torch instead.
-    pip install -e "$DG_LOCAL" --no-build-isolation
+    # Non-editable install with --no-build-isolation. Editable mode goes
+    # through setuptools' `develop` wrapper which makes a recursive
+    # `pip install -e . --use-pep517 --no-deps` call that DOES use build
+    # isolation regardless of the outer flag, so its setup.py can't see
+    # the host torch and fails. DeepGEMM JIT-compiles kernels at runtime,
+    # so editable mode buys nothing.
+    pip install "$DG_LOCAL" --no-build-isolation
 fi
 python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
 
