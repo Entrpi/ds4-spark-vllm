@@ -27,6 +27,20 @@ if [ ! -f "$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py" ]; then
     exit 1
 fi
 
+# 0a. DeepGEMM is required for DSv4-Flash sparse-attention indexer.
+# Use the jasl SM121 fork on Spark; the official DeepSeek-AI repo lacks
+# Blackwell consumer-tier (SM12x) kernels. JIT-compiled at runtime so
+# install is fast (no CUDA compile during pip).
+if ! python3 -c "import deep_gemm" 2>/dev/null; then
+    echo "[ds4] Installing DeepGEMM (jasl SM121 fork)..."
+    DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
+    if [ ! -d "$DG_LOCAL" ]; then
+        git clone --depth=1 https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
+    fi
+    pip install -e "$DG_LOCAL"
+fi
+python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
+
 # 1. Pull the ds4_hybrid_quant source.
 if [ ! -d "$DS4_LOCAL" ]; then
     echo "[ds4] Cloning $DS4_REPO @ $DS4_REF -> $DS4_LOCAL"
