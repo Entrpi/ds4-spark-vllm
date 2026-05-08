@@ -67,6 +67,43 @@ pip install -e "$DS4_LOCAL"
 #     (we use w13_iq2xxs_qs etc.). Without this, load_weights raises
 #     UnboundLocalError on `loaded_params.add(name_mapped)` for any
 #     unrecognized expert tensor.
+# 2b. Patch DeepGEMM's get_arch() to return the SM12x family arch ("120f")
+#     instead of arch-specific ("121a"). The SM120 HC kernels are written
+#     with no SM121-only features, but JIT-compiling for sm_121a yields a
+#     cubin the driver rejects with CUDA_ERROR_INVALID_IMAGE. Family target
+#     "sm_120f" produces a CUBIN compatible with both 120 and 121.
+DG_DEV_RT="$DG_LOCAL/csrc/jit/device_runtime.hpp"
+if [ -f "$DG_DEV_RT" ] && ! grep -q "DS4_GET_ARCH_PATCH" "$DG_DEV_RT"; then
+    echo "[ds4] Patching $DG_DEV_RT get_arch for SM12x family"
+    python3 - <<PY
+p = "$DG_DEV_RT"
+s = open(p).read()
+old = (
+    '        if (major == 10 and minor != 1) {\n'
+    '            if (number_only)\n'
+    '                return "100";\n'
+    '            return support_arch_family ? "100f" : "100a";\n'
+    '        }\n'
+    '        return std::to_string(major * 10 + minor) + (number_only ? "" : "a");\n'
+)
+new = (
+    '        if (major == 10 and minor != 1) {  // DS4_GET_ARCH_PATCH\n'
+    '            if (number_only)\n'
+    '                return "100";\n'
+    '            return support_arch_family ? "100f" : "100a";\n'
+    '        }\n'
+    '        if (major == 12 and support_arch_family) {  // DS4_GET_ARCH_PATCH\n'
+    '            if (number_only) return "120";\n'
+    '            return "120f";\n'
+    '        }\n'
+    '        return std::to_string(major * 10 + minor) + (number_only ? "" : "a");\n'
+)
+assert old in s, "expected get_arch pattern not found"
+open(p, "w").write(s.replace(old, new, 1))
+print("[ds4] device_runtime.hpp patched")
+PY
+fi
+
 DSV4_PY="$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py"
 if ! grep -q "DS4_HYBRID_PATCH" "$DSV4_PY"; then
     echo "[ds4] Patching $DSV4_PY load_weights for unrecognized expert tensors"
