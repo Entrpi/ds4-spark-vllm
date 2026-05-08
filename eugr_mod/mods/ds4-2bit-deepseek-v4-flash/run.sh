@@ -37,7 +37,10 @@ if ! python3 -c "import deep_gemm" 2>/dev/null; then
     if [ ! -d "$DG_LOCAL" ]; then
         git clone --depth=1 https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
     fi
-    pip install -e "$DG_LOCAL"
+    # --no-build-isolation: DeepGEMM's setup.py imports torch, which isn't
+    # available in pep517's isolated build env. Use the container's
+    # already-installed torch instead.
+    pip install -e "$DG_LOCAL" --no-build-isolation
 fi
 python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
 
