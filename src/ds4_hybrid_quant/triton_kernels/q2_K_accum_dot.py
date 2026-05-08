@@ -151,20 +151,19 @@ if HAVE_TRITON:
             q8_blk = e * n_blocks
 
             for blk in range(0, n_blocks):
-                # Load scales[16].
+                # Load q8 bsums[16] and reduce summs.
                 scale_offs = tl.arange(0, N_SCALES)
                 scales = tl.load(w_scales_row + blk * 16 + scale_offs)
-                scale_lo = (scales & 0x0F).to(tl.int32)
                 scale_hi = (scales >> 4).to(tl.int32)
-
-                # Load q8 bsums[16] and reduce summs.
                 bsums = tl.load(
                     q8_bsums_ptr + (q8_blk + blk) * 16 + scale_offs
                 ).to(tl.int32)
                 summs = tl.sum(bsums * scale_hi, axis=0)
 
                 # Per-block isum: 2 outer * 4 shifts * 2 halves = 16 dot pieces.
-                # Each piece is a 16-element int dot.
+                # Each piece is a 16-element int dot. We load each scale_lo
+                # nibble directly from memory via offset (Triton tensors
+                # don't support Python-int subscripting inside @jit).
                 isum = tl.zeros((), dtype=tl.int32)
                 is_idx = 0
                 j16 = tl.arange(0, 16)
@@ -174,17 +173,19 @@ if HAVE_TRITON:
                     for j in tl.static_range(0, 4):  # shift index
                         shift = 2 * j
                         # lo16
+                        sc_lo = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
                         q2_lo = ((tl.load(w_qs_row + base_q2 + j16) >> shift) & 0x03).to(tl.int32)
                         q8_lo = tl.load(q8_qs_ptr + base_q8 + j * 32 + j16).to(tl.int32)
                         s_lo = tl.sum(q2_lo * q8_lo, axis=0)
-                        isum = isum + scale_lo[is_idx] * s_lo
+                        isum = isum + sc_lo * s_lo
                         is_idx += 1
 
                         # hi16
+                        sc_hi = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
                         q2_hi = ((tl.load(w_qs_row + base_q2 + 16 + j16) >> shift) & 0x03).to(tl.int32)
                         q8_hi = tl.load(q8_qs_ptr + base_q8 + j * 32 + 16 + j16).to(tl.int32)
                         s_hi = tl.sum(q2_hi * q8_hi, axis=0)
-                        isum = isum + scale_lo[is_idx] * s_hi
+                        isum = isum + sc_hi * s_hi
                         is_idx += 1
 
                 d_blk = tl.load(w_d_row + blk).to(tl.float32)

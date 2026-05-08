@@ -117,19 +117,15 @@ if HAVE_TRITON:
         # for zero blocks anyway. Note: max_signed is signed so iscale is
         # signed; this matches ds4 exactly.
         iscale = tl.where(zero_block, 0.0, -127.0 / max_signed)
-        d_val = tl.where(zero_block, 0.0, 1.0 / iscale)
+        # Compute d directly from max_signed to match numpy / ds4 bit-exactly:
+        # d = max_signed / -127 (avoids the round-trip 1/(-127/m)).
+        d_val = tl.where(zero_block, 0.0, max_signed / -127.0)
 
-        # Quantize: round-to-nearest-even (Triton's tl.cast(..., tl.int8) on
-        # a float rounds toward zero, so we use rint then cast).
+        # Quantize: lrintf in ds4 uses banker's rounding (round half to even).
+        # Triton provides this via libdevice.rint on the host's CUDA target.
         scaled = x * iscale
-        # Triton has no direct rint; emulate via the (x + 0.5*sign(x))
-        # trick? Better: use the libdevice-equivalent. tl.extra.cuda has
-        # libdevice.rint but availability varies. Implement banker's
-        # rounding via a documented trick: round half to even.
-        # On Spark we can rely on libdevice.rint via tl.extra.libdevice.
-        # For portability across Triton versions we use the round-half-up
-        # variant here and tighten on validation.
-        rounded = tl.where(scaled >= 0, scaled + 0.5, scaled - 0.5)
+        # Use libdevice.rint which compiles to PTX cvt.rni (round-to-nearest-even).
+        rounded = tl.extra.libdevice.rint(scaled)
         rounded = tl.cast(rounded, tl.int32)
         rounded = tl.where(rounded > 127, 127, rounded)
         rounded = tl.where(rounded < -128, -128, rounded)
