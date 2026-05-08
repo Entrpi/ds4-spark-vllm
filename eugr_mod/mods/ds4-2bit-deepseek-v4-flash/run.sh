@@ -63,6 +63,53 @@ fi
 echo "[ds4] pip install -e $DS4_LOCAL"
 pip install -e "$DS4_LOCAL"
 
+# 2a. Patch deepseek_v4.py load_weights to gracefully handle expert
+#     tensor names that don't match the standard w1/w2/w3 mapping
+#     (we use w13_iq2xxs_qs etc.). Without this, load_weights raises
+#     UnboundLocalError on `loaded_params.add(name_mapped)` for any
+#     unrecognized expert tensor.
+DSV4_PY="$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py"
+if ! grep -q "DS4_HYBRID_PATCH" "$DSV4_PY"; then
+    echo "[ds4] Patching $DSV4_PY load_weights for unrecognized expert tensors"
+    python3 - <<PY
+import re
+p = "$DSV4_PY"
+s = open(p).read()
+# Insert name_mapped = None before the inner for loop, and a fallback after.
+old = (
+    '                    for mapping in expert_mapping:\n'
+    '                        param_name, weight_name, expert_id, shard_id = mapping\n'
+)
+new = (
+    '                    name_mapped = None  # DS4_HYBRID_PATCH\n'
+    '                    for mapping in expert_mapping:\n'
+    '                        param_name, weight_name, expert_id, shard_id = mapping\n'
+)
+assert old in s, "expected pattern not found in deepseek_v4.py"
+s = s.replace(old, new, 1)
+old2 = '                    loaded_params.add(name_mapped)\n                    continue\n'
+new2 = (
+    '                    # DS4_HYBRID_PATCH: fall through to default loader if\n'
+    '                    # no expert_mapping entry matched (custom quant params).\n'
+    '                    if name_mapped is None:\n'
+    '                        if name in params_dict:\n'
+    '                            param = params_dict[name]\n'
+    '                            weight_loader = getattr(param, "weight_loader", default_weight_loader)\n'
+    '                            weight_loader(param, loaded_weight)\n'
+    '                            loaded_params.add(name)\n'
+    '                        continue\n'
+    '                    loaded_params.add(name_mapped)\n'
+    '                    continue\n'
+)
+assert old2 in s, "expected loaded_params.add line not found"
+s = s.replace(old2, new2, 1)
+open(p, "w").write(s)
+print("[ds4] deepseek_v4.py patched")
+PY
+    # Clear any compiled bytecode of the patched file.
+    find "$SITE_PACKAGES/vllm/model_executor/models/__pycache__" -name "deepseek_v4*" -delete 2>/dev/null || true
+fi
+
 # 3. Sanity-check registration.
 python3 - <<'PY'
 from vllm.model_executor.layers.quantization import (
