@@ -36,42 +36,10 @@ DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
 if [ ! -d "$DG_LOCAL" ]; then
     git clone --depth=1 --recurse-submodules https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
 fi
-# CRITICAL: wipe build/ before reinstall. setup.py's incremental build keeps
-# python_api.o cached based on mtime; if the source headers were patched in
-# place (which `git checkout TAG -- file` does), pip's --force-reinstall does
-# NOT trigger a recompile because the .o is "newer" than the affected .hpp's.
-# Without this wipe, dispatch tables look correct on disk but the running
-# .so is stale and asserts "Unsupported architecture".
-rm -rf "$DG_LOCAL/build" "$DG_LOCAL"/*.egg-info
-pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps --no-cache-dir
-python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
-
-# 1. Pull the ds4_hybrid_quant source.
-if [ ! -d "$DS4_LOCAL" ]; then
-    echo "[ds4] Cloning $DS4_REPO @ $DS4_REF -> $DS4_LOCAL"
-    git clone --depth=1 --branch "$DS4_REF" "$DS4_REPO" "$DS4_LOCAL"
-else
-    echo "[ds4] Updating $DS4_LOCAL"
-    git -C "$DS4_LOCAL" fetch origin "$DS4_REF"
-    (git -C "$DS4_LOCAL" checkout "$DS4_REF" || true)
-    git -C "$DS4_LOCAL" pull --ff-only
-fi
-
-# 2. Install. The entry_point declared in pyproject.toml registers our
-#    quant config via vLLM's general-plugin discovery on every vLLM start.
-echo "[ds4] pip install -e $DS4_LOCAL"
-pip install -e "$DS4_LOCAL"
-
-# 2a. Patch deepseek_v4.py load_weights to gracefully handle expert
-#     tensor names that don't match the standard w1/w2/w3 mapping
-#     (we use w13_iq2xxs_qs etc.). Without this, load_weights raises
-#     UnboundLocalError on `loaded_params.add(name_mapped)` for any
-#     unrecognized expert tensor.
-# 2b. Patch DeepGEMM's get_arch() to return the SM12x family arch ("120f")
-#     instead of arch-specific ("121a"). The SM120 HC kernels are written
-#     with no SM121-only features, but JIT-compiling for sm_121a yields a
-#     cubin the driver rejects with CUDA_ERROR_INVALID_IMAGE. Family target
-#     "sm_120f" produces a CUBIN compatible with both 120 and 121.
+# 0a-1. Patch DeepGEMM's get_arch() BEFORE the install so the rebuilt
+#       binary has the SM12x family target baked in. JIT-compiling for
+#       sm_121a yields a CUBIN the driver rejects with
+#       CUDA_ERROR_INVALID_IMAGE; sm_120f works on both 120 and 121.
 DG_DEV_RT="$DG_LOCAL/csrc/jit/device_runtime.hpp"
 if [ -f "$DG_DEV_RT" ] && ! grep -q "DS4_GET_ARCH_PATCH" "$DG_DEV_RT"; then
     echo "[ds4] Patching $DG_DEV_RT get_arch for SM12x family"
@@ -104,6 +72,37 @@ print("[ds4] device_runtime.hpp patched")
 PY
 fi
 
+# CRITICAL: wipe build/ before reinstall. setup.py's incremental build keeps
+# python_api.o cached based on mtime; if the source headers were patched in
+# place (which `git checkout TAG -- file` does), pip's --force-reinstall does
+# NOT trigger a recompile because the .o is "newer" than the affected .hpp's.
+# Without this wipe, dispatch tables look correct on disk but the running
+# .so is stale and asserts "Unsupported architecture".
+rm -rf "$DG_LOCAL/build" "$DG_LOCAL"/*.egg-info
+pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps --no-cache-dir
+python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
+
+# 1. Pull the ds4_hybrid_quant source.
+if [ ! -d "$DS4_LOCAL" ]; then
+    echo "[ds4] Cloning $DS4_REPO @ $DS4_REF -> $DS4_LOCAL"
+    git clone --depth=1 --branch "$DS4_REF" "$DS4_REPO" "$DS4_LOCAL"
+else
+    echo "[ds4] Updating $DS4_LOCAL"
+    git -C "$DS4_LOCAL" fetch origin "$DS4_REF"
+    (git -C "$DS4_LOCAL" checkout "$DS4_REF" || true)
+    git -C "$DS4_LOCAL" pull --ff-only
+fi
+
+# 2. Install. The entry_point declared in pyproject.toml registers our
+#    quant config via vLLM's general-plugin discovery on every vLLM start.
+echo "[ds4] pip install -e $DS4_LOCAL"
+pip install -e "$DS4_LOCAL"
+
+# 2a. Patch deepseek_v4.py load_weights to gracefully handle expert
+#     tensor names that don't match the standard w1/w2/w3 mapping
+#     (we use w13_iq2xxs_qs etc.). Without this, load_weights raises
+#     UnboundLocalError on `loaded_params.add(name_mapped)` for any
+#     unrecognized expert tensor.
 DSV4_PY="$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py"
 if ! grep -q "DS4_HYBRID_PATCH" "$DSV4_PY"; then
     echo "[ds4] Patching $DSV4_PY load_weights for unrecognized expert tensors"
