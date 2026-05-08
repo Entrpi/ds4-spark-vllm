@@ -187,9 +187,30 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
 
         out = torch.zeros((T, hidden), dtype=x.dtype, device=device)
 
+        # DS4_NAN_DEBUG: helper to fail fast at the first NaN/Inf and
+        # report the call-site stage name. Disabled at end-to-end perf
+        # but invaluable for first-light debugging.
+        def _nanchk(t_, name):
+            if torch.is_floating_point(t_):
+                if torch.isnan(t_).any() or torch.isinf(t_).any():
+                    bad_n = int(torch.isnan(t_).sum().item())
+                    bad_i = int(torch.isinf(t_).sum().item())
+                    finite = t_[torch.isfinite(t_)]
+                    fmin = float(finite.min().item()) if finite.numel() else float("nan")
+                    fmax = float(finite.max().item()) if finite.numel() else float("nan")
+                    raise RuntimeError(
+                        f"[ds4_apply] NaN/Inf at {name}: shape={tuple(t_.shape)} "
+                        f"dtype={t_.dtype} nans={bad_n} infs={bad_i} "
+                        f"finite_min={fmin:.4e} finite_max={fmax:.4e}"
+                    )
+
+        _nanchk(x, "input x")
+
         # Quantize all token activations in one shot.
         x_blocks = x.reshape(T * n_blocks_in, QK_K).to(torch.float32)
+        _nanchk(x_blocks, "x_blocks (post fp32 cast)")
         x_q_qs, x_q_d, x_q_bsums = quantize_q8_K_triton(x_blocks)
+        _nanchk(x_q_d, "x_q_d (Q8_K activation scale)")
         x_q_qs = x_q_qs.reshape(T, n_blocks_in, QK_K)
         x_q_d = x_q_d.reshape(T, n_blocks_in)
         x_q_bsums = x_q_bsums.reshape(T, n_blocks_in, 16)
@@ -200,40 +221,47 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 weight = topk_weights[t, k]
 
                 # Gate / up: w13 is laid out as [n_experts, gate_rows | up_rows, ...]
-                # Slice the two halves.
                 gate_qs = layer.w13_iq2xxs_qs[expert, :intermediate]
                 gate_d = layer.w13_iq2xxs_d[expert, :intermediate]
                 up_qs = layer.w13_iq2xxs_qs[expert, intermediate:]
                 up_d = layer.w13_iq2xxs_d[expert, intermediate:]
+                _nanchk(gate_d, f"gate_d (t={t},k={k},expert={expert})")
+                _nanchk(up_d,   f"up_d   (t={t},k={k},expert={expert})")
 
                 gate_out, up_out = iq2_xxs_pair_dot_triton(
                     gate_qs, gate_d, up_qs, up_d,
                     x_q_qs[t], x_q_d[t],
                 )
-                # gate_out: (intermediate,), up_out: (intermediate,)
+                _nanchk(gate_out, f"gate_out post iq2_pair (t={t},k={k},expert={expert})")
+                _nanchk(up_out,   f"up_out   post iq2_pair (t={t},k={k},expert={expert})")
 
-                # SwiGLU: silu(gate) * up. (No clamp by default; the model's
-                # ``swiglu_limit`` is exposed through the layer's pre-kernel
-                # path elsewhere — for the first cut we ignore it.)
+                # SwiGLU: silu(gate) * up.
                 mid = torch.nn.functional.silu(gate_out) * up_out
+                _nanchk(mid, f"mid post SwiGLU (t={t},k={k},expert={expert})")
 
                 # Quantize mid to Q8_K.
                 mid_blocks = mid.reshape(n_blocks_int, QK_K).to(torch.float32)
+                _nanchk(mid_blocks, f"mid_blocks (t={t},k={k},expert={expert})")
                 mid_qs, mid_d, mid_bsums = quantize_q8_K_triton(mid_blocks)
+                _nanchk(mid_d, f"mid_d post Q8_K quant (t={t},k={k},expert={expert})")
 
-                # Down projection. We re-use the q2_K_accum kernel even
-                # though we have a single expert here — pass n_experts=1
-                # arrays.
+                # Down projection (single expert via accum kernel with n_experts=1).
                 w_scales = layer.w2_q2k_scales[expert].unsqueeze(0)
                 w_qs = layer.w2_q2k_qs[expert].unsqueeze(0)
                 w_d = layer.w2_q2k_d[expert].unsqueeze(0)
                 w_dmin = layer.w2_q2k_dmin[expert].unsqueeze(0)
+                _nanchk(w_d,    f"w_d    (t={t},k={k},expert={expert})")
+                _nanchk(w_dmin, f"w_dmin (t={t},k={k},expert={expert})")
 
                 down_out = q2_K_accum_dot_triton(
                     w_scales, w_qs, w_d, w_dmin,
                     mid_qs.unsqueeze(0), mid_d.unsqueeze(0),
                     mid_bsums.unsqueeze(0),
                 )
+                _nanchk(down_out, f"down_out post q2_K (t={t},k={k},expert={expert})")
+                _nanchk(weight,   f"topk weight (t={t},k={k},expert={expert})")
                 out[t].add_(down_out.to(x.dtype) * weight)
+                _nanchk(out[t], f"out[t] post accum (t={t},k={k},expert={expert})")
 
+        _nanchk(out, "final out")
         return out
