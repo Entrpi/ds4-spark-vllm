@@ -31,16 +31,19 @@ fi
 # Use the jasl SM121 fork on Spark; the official DeepSeek-AI repo lacks
 # Blackwell consumer-tier (SM12x) kernels. JIT-compiled at runtime so
 # install is fast (no CUDA compile during pip).
-echo "[ds4] Installing DeepGEMM (jasl SM121 fork, with our SM12 dispatch alias)..."
+echo "[ds4] Installing DeepGEMM (jasl SM121 fork + cherry-picked SM120 HC files)..."
 DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
 if [ ! -d "$DG_LOCAL" ]; then
     git clone --depth=1 --recurse-submodules https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
 fi
-# Always force-reinstall so source patches (e.g., the arch_major==12 alias)
-# are picked up. Non-editable + --no-build-isolation: setuptools' `develop`
-# wrapper otherwise recursively calls `pip install -e . --use-pep517` which
-# re-enables build isolation and breaks (DeepGEMM's setup.py imports torch).
-pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps
+# CRITICAL: wipe build/ before reinstall. setup.py's incremental build keeps
+# python_api.o cached based on mtime; if the source headers were patched in
+# place (which `git checkout TAG -- file` does), pip's --force-reinstall does
+# NOT trigger a recompile because the .o is "newer" than the affected .hpp's.
+# Without this wipe, dispatch tables look correct on disk but the running
+# .so is stale and asserts "Unsupported architecture".
+rm -rf "$DG_LOCAL/build" "$DG_LOCAL"/*.egg-info
+pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps --no-cache-dir
 python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
 
 # 1. Pull the ds4_hybrid_quant source.
