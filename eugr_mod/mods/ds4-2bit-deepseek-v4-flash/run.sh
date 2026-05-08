@@ -15,7 +15,7 @@
 set -euo pipefail
 
 SITE_PACKAGES="${SITE_PACKAGES:-/usr/local/lib/python3.12/dist-packages}"
-DS4_REPO="${DS4_REPO:-https://github.com/<owner>/vllm-hybrid-quant-ds4.git}"
+DS4_REPO="${DS4_REPO:-https://github.com/Entrpi/ds4-spark-vllm.git}"
 DS4_REF="${DS4_REF:-main}"
 DS4_LOCAL="${DS4_LOCAL:-/workspace/vllm-hybrid-quant-ds4}"
 
