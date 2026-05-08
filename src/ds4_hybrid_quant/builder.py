@@ -154,7 +154,18 @@ def open_gguf(path: str | Path) -> tuple[Any, list[GgufTensor], dict[str, Any]]:
             )
         )
 
-    metadata = {f.name: f.value for f in reader.fields.values()}
+    metadata: dict[str, Any] = {}
+    for k, f in reader.fields.items():
+        try:
+            vals = [f.parts[i] for i in f.data]
+            if len(vals) == 1 and vals[0].size == 1:
+                metadata[k] = vals[0].item()
+            elif len(vals) == 1:
+                metadata[k] = vals[0]
+            else:
+                metadata[k] = vals
+        except Exception:
+            pass
     return reader, tensors, metadata
 
 
