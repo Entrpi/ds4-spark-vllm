@@ -144,12 +144,27 @@ def main() -> int:
     for name, shard in fp8_manifest.items():
         shards_to_files.setdefault(shard, []).append(name)
 
+    skipped: list[str] = []
     for shard, names in shards_to_files.items():
         log.info("  downloading %s (%d tensors)", shard, len(names))
         path = hf_hub_download(args.fp8, shard)
         with safe_open(path, framework="pt") as f:
+            actual_keys = set(f.keys())
             for name in names:
+                # Be tolerant: the sgl-project index has occasional entries
+                # that don't actually exist in the shard (e.g.
+                # layers.0.attn.wo_a.scale is in the index but not in
+                # the file because wo_a is kept at higher precision).
+                if name not in actual_keys:
+                    skipped.append(name)
+                    continue
                 add_tensor(name, f.get_tensor(name))
+    if skipped:
+        log.warning(
+            "  skipped %d tensors not present in their advertised shards "
+            "(sgl-project index has %d such phantom entries; first 5: %s)",
+            len(skipped), len(skipped), skipped[:5],
+        )
 
     flush_shard()
 
