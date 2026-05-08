@@ -1,0 +1,56 @@
+# Recipe: DeepSeek-V4-Flash with ds4-style 2-bit routed experts + FP8 dense.
+#
+# Routed gate/up at IQ2_XXS, routed down at Q2_K, attention/shared/dense at
+# block-FP8 with UE8M0 scales. Targets a single DGX Spark.
+#
+# Build the model first via:
+#   python scripts/build-ds4-2bit-checkpoint.py \
+#       --gguf  ~/models/deepseek-v4-flash-q2.gguf \
+#       --fp8   sgl-project/DeepSeek-V4-Flash-FP8 \
+#       --output ~/models/deepseek-v4-flash-ds4-q2
+
+recipe_version: "1"
+name: DeepSeek-V4-Flash-DS4-Q2
+description: ds4-style 2-bit DSv4-Flash on a single DGX Spark via vLLM
+
+# Local model directory created by build-ds4-2bit-checkpoint.py.
+model: /home/ent/models/deepseek-v4-flash-ds4-q2
+
+container: vllm-node
+solo_only: true
+
+mods:
+  - mods/ds4-2bit-deepseek-v4-flash
+
+defaults:
+  port: 8000
+  host: 0.0.0.0
+  gpu_memory_utilization: 0.85
+  # Antirez recommends ~100k-300k context on 128GB; 100k leaves ~5GB headroom
+  # for the indexer + KV at FP8 KV.
+  max_model_len: 100000
+  max_num_batched_tokens: 16384
+
+env:
+  # Required for the b12x SM121 path; the mod's run.sh asserts these.
+  FLASHINFER_DISABLE_VERSION_CHECK: 1
+  VLLM_USE_FLASHINFER_MOE_FP16: 1
+  VLLM_ALLOW_LONG_MAX_MODEL_LEN: 1
+  VLLM_FLASHINFER_ALLREDUCE_BACKEND: trtllm
+
+command: |
+  vllm serve {model} \
+    --served-model-name dsv4 \
+    --quantization deepseek_v4_hybrid_iq2 \
+    --host {host} \
+    --port {port} \
+    --max-model-len {max_model_len} \
+    --max-num-batched-tokens {max_num_batched_tokens} \
+    --gpu-memory-utilization {gpu_memory_utilization} \
+    --kv-cache-dtype fp8 \
+    --attention-backend FLASHINFER \
+    --load-format fastsafetensors
+  # Note: speculative decoding (MTP) intentionally disabled in v1; the
+  # main-model path is the correctness gate. Add
+  #   --speculative-config '{"method":"mtp","num_speculative_tokens":2}'
+  # in v2 once main-model logits are validated against ds4.
