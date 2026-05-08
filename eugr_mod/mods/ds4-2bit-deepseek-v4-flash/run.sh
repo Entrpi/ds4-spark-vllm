@@ -31,20 +31,16 @@ fi
 # Use the jasl SM121 fork on Spark; the official DeepSeek-AI repo lacks
 # Blackwell consumer-tier (SM12x) kernels. JIT-compiled at runtime so
 # install is fast (no CUDA compile during pip).
-if ! python3 -c "import deep_gemm" 2>/dev/null; then
-    echo "[ds4] Installing DeepGEMM (jasl SM121 fork)..."
-    DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
-    if [ ! -d "$DG_LOCAL" ]; then
-        git clone --depth=1 https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
-    fi
-    # Non-editable install with --no-build-isolation. Editable mode goes
-    # through setuptools' `develop` wrapper which makes a recursive
-    # `pip install -e . --use-pep517 --no-deps` call that DOES use build
-    # isolation regardless of the outer flag, so its setup.py can't see
-    # the host torch and fails. DeepGEMM JIT-compiles kernels at runtime,
-    # so editable mode buys nothing.
-    pip install "$DG_LOCAL" --no-build-isolation
+echo "[ds4] Installing DeepGEMM (jasl SM121 fork, with our SM12 dispatch alias)..."
+DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
+if [ ! -d "$DG_LOCAL" ]; then
+    git clone --depth=1 --recurse-submodules https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
 fi
+# Always force-reinstall so source patches (e.g., the arch_major==12 alias)
+# are picked up. Non-editable + --no-build-isolation: setuptools' `develop`
+# wrapper otherwise recursively calls `pip install -e . --use-pep517` which
+# re-enables build isolation and breaks (DeepGEMM's setup.py imports torch).
+pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps
 python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
 
 # 1. Pull the ds4_hybrid_quant source.
