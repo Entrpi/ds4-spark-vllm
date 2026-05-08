@@ -36,6 +36,80 @@ DG_LOCAL="${DG_LOCAL:-/workspace/DeepGEMM}"
 if [ ! -d "$DG_LOCAL" ]; then
     git clone --depth=1 --recurse-submodules https://github.com/jasl/DeepGEMM.git "$DG_LOCAL"
 fi
+# 0a-0. Patch DeepGEMM's NVRTC compile path for two bugs that cause the
+#       SM120 HC kernel to fail at cuModuleLoad with CUDA_ERROR_INVALID_IMAGE.
+#       Diagnosed: NVRTC_ERROR_COMPILATION (missing CCCL include path under
+#       CUDA 13) is silently swallowed; a 0-byte cubin gets written to the
+#       JIT cache; the driver rejects it. NVCC path works fine — these
+#       patches make NVRTC path also work.
+#
+#       Patch 1: NVCC auto-injects -isystem .../include/cccl on CUDA 13;
+#                NVRTC does not. Add -I .../include/cccl explicitly.
+#       Patch 2: assert on NVRTC compile failure rather than continuing to
+#                write a poisoned 0-byte cubin.
+DG_COMPILER="$DG_LOCAL/csrc/jit/compiler.hpp"
+if [ -f "$DG_COMPILER" ] && ! grep -q "DS4_NVRTC_CCCL_PATCH" "$DG_COMPILER"; then
+    echo "[ds4] Patching $DG_COMPILER NVRTC include + error-propagation"
+    python3 - <<PY
+p = "$DG_COMPILER"
+s = open(p).read()
+
+# Patch 1: add CCCL include directory for CUDA 13+.
+old1 = (
+    '        // Build include directories list\n'
+    '        std::string include_dirs;\n'
+    '        include_dirs += fmt::format("-I{} ", library_include_path.string());\n'
+    '        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());\n'
+)
+new1 = (
+    '        // Build include directories list\n'
+    '        std::string include_dirs;\n'
+    '        include_dirs += fmt::format("-I{} ", library_include_path.string());\n'
+    '        include_dirs += fmt::format("-I{} ", (cuda_home / "include").string());\n'
+    '        // DS4_NVRTC_CCCL_PATCH: CUDA 13 relocated libcudacxx to\n'
+    '        // include/cccl/cuda/std/. NVCC auto-injects this; NVRTC does not.\n'
+    '        {\n'
+    '            const auto cccl_dir = cuda_home / "include" / "cccl";\n'
+    '            if (std::filesystem::exists(cccl_dir))\n'
+    '                include_dirs += fmt::format("-I{} ", cccl_dir.string());\n'
+    '        }\n'
+)
+assert old1 in s, "expected NVRTC include_dirs pattern not found"
+s = s.replace(old1, new1, 1)
+
+# Patch 2: assert on NVRTC compile failure (don't silently write empty cubin).
+old2 = (
+    '        const auto compile_result = nvrtcCompileProgram(program, static_cast<int>(option_cstrs.size()), option_cstrs.data());\n'
+    '\n'
+    '        // Get and print compiler log\n'
+)
+new2 = (
+    '        const auto compile_result = nvrtcCompileProgram(program, static_cast<int>(option_cstrs.size()), option_cstrs.data());\n'
+    '\n'
+    '        // DS4_NVRTC_CCCL_PATCH: surface NVRTC compile errors instead of\n'
+    '        // silently writing a 0-byte cubin that the driver later rejects.\n'
+    '        if (compile_result != NVRTC_SUCCESS) {\n'
+    '            size_t log_size_dbg = 0;\n'
+    '            nvrtcGetProgramLogSize(program, &log_size_dbg);\n'
+    '            if (log_size_dbg > 1) {\n'
+    '                std::string log_dbg(log_size_dbg, \'\\\\0\');\n'
+    '                nvrtcGetProgramLog(program, log_dbg.data());\n'
+    '                fprintf(stderr, "NVRTC compile failed:\\\\n%s\\\\n", log_dbg.c_str());\n'
+    '            }\n'
+    '            nvrtcDestroyProgram(&program);\n'
+    '            DG_HOST_ASSERT(false and "NVRTC compilation failed");\n'
+    '        }\n'
+    '\n'
+    '        // Get and print compiler log\n'
+)
+assert old2 in s, "expected NVRTC compile-result pattern not found"
+s = s.replace(old2, new2, 1)
+
+open(p, "w").write(s)
+print("[ds4] compiler.hpp patched (CCCL include + error propagation)")
+PY
+fi
+
 # 0a-1. Patch DeepGEMM's get_arch() BEFORE the install so the rebuilt
 #       binary has the SM12x family target baked in. JIT-compiling for
 #       sm_121a yields a CUBIN the driver rejects with
@@ -79,6 +153,10 @@ fi
 # Without this wipe, dispatch tables look correct on disk but the running
 # .so is stale and asserts "Unsupported architecture".
 rm -rf "$DG_LOCAL/build" "$DG_LOCAL"/*.egg-info
+# Also wipe the JIT cubin cache: previous runs may have written 0-byte
+# cubins (pre-compiler.hpp-patch) keyed by source+flags hash. Those
+# poisoned entries persist until evicted manually.
+rm -rf /root/.deep_gemm /root/.cache/deep_gemm "$DG_LOCAL/.deep_gemm" 2>/dev/null || true
 pip install "$DG_LOCAL" --no-build-isolation --force-reinstall --no-deps --no-cache-dir
 python3 -c "import deep_gemm; print(f'[ds4] deep_gemm OK from {deep_gemm.__file__}')"
 
