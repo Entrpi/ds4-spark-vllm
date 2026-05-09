@@ -274,29 +274,43 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         global _apply_call_count
         _apply_call_count += 1
         _call_n = _apply_call_count
-        # DS4_TOPK_DBG: one-shot dump of topk routing values from the
-        # first 3 small-T calls (covers prefill + first 2 decode steps),
-        # to verify gate output is sensible.
-        if T <= 16 and getattr(layer, "_ds4_topk_dumped", 0) < 3:
-            layer._ds4_topk_dumped = getattr(layer, "_ds4_topk_dumped", 0) + 1
+        # DS4_ROUTE: per-call routing entropy, gated by /logs/ds4_route_arm
+        # existence so the dump only fires during real inference (not
+        # warmup / autotuning). Touch the arm file before curl, rm after.
+        # Also extracts layer index from layer.prefix so we can correlate
+        # entropy across the 43-layer stack.
+        try:
+            import os as _os
+            _arm = _os.path.exists("/logs/ds4_route_arm")
+        except Exception:
+            _arm = False
+        if T <= 16 and _arm:
             try:
-                _ti = topk_ids.detach().cpu()
-                _tw = topk_weights.detach().float().cpu()
+                import re as _re
+                _prefix = getattr(layer, "prefix", "") or ""
+                _m = _re.search(r"\.layers\.(\d+)\.", _prefix)
+                _lidx = int(_m.group(1)) if _m else -1
+                _tw = topk_weights.detach().float()
+                # Normalize per-token (since vLLM's topk_weights are scaled
+                # by routed_scaling_factor and don't sum to 1).
+                _tw_norm = _tw / _tw.sum(dim=-1, keepdim=True).clamp(min=1e-12)
+                _ent = -(_tw_norm * _tw_norm.clamp(min=1e-12).log()).sum(dim=-1)
+                _ent_mean = float(_ent.mean().item())
+                _max_ent = float(torch.log(torch.tensor(float(top_k))).item())
+                _max_w = float(_tw_norm.max().item())
+                _min_w = float(_tw_norm.min().item())
+                # Show top-1 expert IDs across tokens (for variety check)
+                _top1 = topk_weights.argmax(dim=-1)
+                _top1_ids = topk_ids.gather(-1, _top1.unsqueeze(-1)).squeeze(-1).tolist()
                 print(
-                    f"[DS4_TOPK_DBG] call={_call_n} T={T} top_k={top_k} "
-                    f"topk_ids.shape={tuple(_ti.shape)} dtype={_ti.dtype}",
+                    f"[DS4_ROUTE] call={_call_n} layer={_lidx} T={T} "
+                    f"ent={_ent_mean:.3f}/{_max_ent:.3f} "
+                    f"max_w={_max_w:.3f} min_w={_min_w:.3f} "
+                    f"top1_ids={_top1_ids}",
                     flush=True,
                 )
-                for _row in range(min(_ti.shape[0], 4)):
-                    _ids = _ti[_row].tolist()
-                    _wts = [round(float(v), 4) for v in _tw[_row].tolist()]
-                    _wsum = float(_tw[_row].sum().item())
-                    print(
-                        f"[DS4_TOPK_DBG] tok={_row} ids={_ids} wts={_wts} sum={_wsum:.4f}",
-                        flush=True,
-                    )
             except Exception as _e:
-                print(f"[DS4_TOPK_DBG] error: {_e!r}", flush=True)
+                print(f"[DS4_ROUTE] error: {_e!r}", flush=True)
         if T <= 16:
             _xfin = x[torch.isfinite(x)] if torch.is_floating_point(x) else x.float()
             if _xfin.numel():
