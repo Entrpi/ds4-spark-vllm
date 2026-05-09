@@ -103,6 +103,11 @@ _REMAP = [
     # Indexer weights_proj + indexer compressor (same parent, just rename).
     ("attn.indexer.weights_proj.weight",
      [("attn.indexer.weights_proj.weight", None)]),
+    # Indexer wq_b: live model registers as fp8_e4m3fn at the same shape as
+    # safetensor (which already has fp8); plus its scale.
+    ("attn.indexer.wq_b.weight", [("attn.indexer.wq_b.weight", None)]),
+    ("attn.indexer.wq_b.weight_scale_inv",
+     [("attn.indexer.wq_b.scale", None)]),
     ("attn.indexer.compressor.fused_wkv_wgate.weight",
      [("attn.indexer.compressor.wkv.weight", 0),
       ("attn.indexer.compressor.wgate.weight", 1)]),
@@ -224,17 +229,28 @@ def complete_load(
             param = params_dict[param_name]
             with torch.no_grad():
                 if param.dtype != tensor.dtype:
-                    # Dtype mismatch: usually fine for weight↔scale paths
-                    # where the model registered fp8 but the source is fp8 in
-                    # a different e-format. Cast through.
-                    if param.dtype == tensor.dtype:
-                        pass
-                    else:
-                        # try view if it's just a fp8 dtype tag mismatch
+                    # Dtype mismatch handling. Two cases:
+                    # 1. Cross-fp8 view: e8m0 stored as uint8 etc. — view OK.
+                    # 2. bf16/fp16/fp32 source, fp8 param: a real value
+                    #    conversion (saturating clamp + round). Lossy but
+                    #    forward-pass-functional with weight_scale_inv=1.0
+                    #    (which load_completion already defaulted).
+                    src_byte = tensor.element_size()
+                    dst_byte = param.element_size()
+                    fp8s = (torch.float8_e4m3fn, torch.float8_e5m2)
+                    if src_byte == dst_byte:
+                        # same byte width — view is safe (e.g. uint8↔e8m0)
                         try:
                             tensor = tensor.view(param.dtype)
                         except RuntimeError:
                             tensor = tensor.to(param.dtype)
+                    elif param.dtype in fp8s and tensor.dtype in (
+                        torch.bfloat16, torch.float16, torch.float32
+                    ):
+                        # real bf16/fp16/fp32 → fp8 conversion
+                        tensor = tensor.to(param.dtype)
+                    else:
+                        tensor = tensor.to(param.dtype)
                 if param.shape != tensor.shape:
                     raise ValueError(
                         f"shape mismatch: param={tuple(param.shape)} "
