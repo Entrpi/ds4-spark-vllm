@@ -25,9 +25,23 @@ try:
     )
     from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
+    # Try the DSv4-specific FP8 config (lmxxf image only). It subclasses
+    # Fp8Config and adds the ``is_scale_e8m0`` property that drives
+    # SM12x-aware scale interpretation in the FP8 linear method. Critical
+    # for correctness on Spark — without this we use generic Fp8Config and
+    # the kernels read scales in the wrong format.
+    try:
+        from vllm.model_executor.models.deepseek_v4 import DeepseekV4FP8Config
+        _HAVE_DSV4_FP8 = True
+    except ImportError:
+        DeepseekV4FP8Config = None  # type: ignore[assignment]
+        _HAVE_DSV4_FP8 = False
+
     HAVE_VLLM = True
 except ImportError:  # pragma: no cover - dev path without vLLM installed
     HAVE_VLLM = False
+    _HAVE_DSV4_FP8 = False
+    DeepseekV4FP8Config = None  # type: ignore[assignment]
     QuantizationConfig = object  # type: ignore[assignment]
     def register_quantization_config(name):  # type: ignore[no-redef]
         def _decorator(cls):
@@ -71,10 +85,19 @@ class Ds4HybridIq2Config(QuantizationConfig):
         self.scale_fmt = scale_fmt
         self.activation_scheme = activation_scheme
 
-        # The dense layers go through this embedded FP8 config. Matches the
-        # sgl-project DeepSeek-V4-Flash-FP8 layout (UE8M0 scales, block-128
-        # weights, dynamic activations).
-        self._fp8_config = Fp8Config(
+        # The dense layers go through an embedded FP8 config. CRITICAL on
+        # SM121 / lmxxf vLLM: prefer DeepseekV4FP8Config (subclass) over
+        # stock Fp8Config — it carries the ``is_scale_e8m0`` property that
+        # drives the correct scale-format interpretation in the FP8 linear
+        # method. Without it the kernels read e8m0 scales as fp32 (or vice
+        # versa) and produce gibberish.
+        _fp8_cls = DeepseekV4FP8Config if _HAVE_DSV4_FP8 else Fp8Config
+        print(
+            f"[DS4_TRACE] Ds4HybridIq2Config: using {_fp8_cls.__name__} "
+            f"for non-MoE FP8 layers",
+            flush=True,
+        )
+        self._fp8_config = _fp8_cls(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=self.activation_scheme,
             weight_block_size=self.weight_block_size,
