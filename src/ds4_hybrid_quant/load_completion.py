@@ -122,6 +122,16 @@ _REMAP = [
     ("hc_ffn_base", [("hc_ffn_base", None)]),
     ("hc_attn_scale", [("hc_attn_scale", None)]),
     ("hc_ffn_scale", [("hc_ffn_scale", None)]),
+    # CRITICAL: layer-level norms (FFN-input + attn-input) and
+    # attention-internal Q/KV norms. Without these we previously fell into
+    # the Phase 1 default-init for *_norm.weight which set them to 1.0,
+    # producing post-norm activations with magnitude ~sqrt(hidden) instead
+    # of the trained ~15-30. Layer-by-layer hidden-state compare against
+    # ds4 reference proved this is the dominant correctness bug.
+    ("attn_norm.weight", [("attn_norm.weight", None)]),
+    ("ffn_norm.weight", [("ffn_norm.weight", None)]),
+    ("attn.kv_norm.weight", [("attn.kv_norm.weight", None)]),
+    ("attn.q_norm.weight", [("attn.q_norm.weight", None)]),
 ]
 
 
@@ -163,25 +173,27 @@ def complete_load(
         print("[DS4_LOAD_COMP] nothing to do (all params loaded)", flush=True)
         return
 
-    # Phase 1: default-init scales / biases / norms.
-    initialized = []
-    with torch.no_grad():
-        for k in list(unloaded):
-            d = _default_for(k)
-            if d is None:
-                continue
-            params_dict[k].data.fill_(d)
-            loaded_params.add(k)
-            initialized.append(k)
-    print(f"[DS4_LOAD_COMP] defaulted {len(initialized)} scale/bias/norm params",
+    # DS4_LOAD_COMP_DBG: print first few unloaded names so we can see live
+    # parameter naming (e.g. whether `layers.K.X` or `model.layers.K.X`).
+    # Helps verify that remap rule suffix-matching will work.
+    sample_unloaded = sorted(unloaded)[:8]
+    print(f"[DS4_LOAD_COMP_DBG] sample unloaded ({len(unloaded)} total): "
+          f"{sample_unloaded}", flush=True)
+    norm_unloaded = [k for k in unloaded if "norm.weight" in k]
+    print(f"[DS4_LOAD_COMP_DBG] norm-weight unloaded count: "
+          f"{len(norm_unloaded)} (sample: {sorted(norm_unloaded)[:5]})",
           flush=True)
 
-    # Phase 2: direct-load remaining via remap rules.
-    still = [k for k in params_dict if k not in loaded_params]
-    if not still:
-        print("[DS4_LOAD_COMP] all done after default-init", flush=True)
-        return
+    # CHANGED 2026-05-10: reordered phases. Previously Phase 1 was
+    # default-init (which would default norm weights to 1.0 BEFORE any
+    # remap rule had a chance to load them from disk — silently breaking
+    # the trained norm scaling and producing post-norm magnitude
+    # ~sqrt(hidden) instead of trained values). Now we direct-load via
+    # remap rules first, then only default-init what's still unloaded
+    # (= things genuinely absent from disk like quantization scales for
+    # methods that don't use them, biases, etc.).
 
+    # Build weight_map for direct-load.
     idx_path = os.path.join(ckpt_dir, "model.safetensors.index.json")
     with open(idx_path) as f:
         weight_map = json.load(f)["weight_map"]
@@ -204,9 +216,10 @@ def complete_load(
             _opened[path] = safe_open(path, framework="pt")
         return _opened[path].get_tensor(safetensor_name)
 
+    # Phase 1 (was Phase 2): direct-load via remap rules.
     loaded_count = 0
     failed = []
-    for param_name in still:
+    for param_name in list(unloaded):
         # Find a remap rule whose suffix matches the end of param_name.
         rule = None
         for suffix, sources in _REMAP:
@@ -273,6 +286,26 @@ def complete_load(
 
     print(f"[DS4_LOAD_COMP] direct-loaded {loaded_count} params via remap rules",
           flush=True)
+
+    # Phase 2 (was Phase 1): default-init params still unloaded that match
+    # known scale/bias/norm patterns. With phase order swapped, this now
+    # only fires for params truly absent from disk — quantization scales
+    # for layers that don't carry them, biases that don't exist, etc.
+    initialized = []
+    failed_after_default = []
+    with torch.no_grad():
+        for param_name, why in list(failed):
+            d = _default_for(param_name)
+            if d is None:
+                failed_after_default.append((param_name, why))
+                continue
+            params_dict[param_name].data.fill_(d)
+            loaded_params.add(param_name)
+            initialized.append(param_name)
+    print(f"[DS4_LOAD_COMP] defaulted {len(initialized)} scale/bias/norm "
+          f"params (no-disk fallback)", flush=True)
+
+    failed = failed_after_default
     if failed:
         print(f"[DS4_LOAD_COMP] {len(failed)} params still failed:", flush=True)
         for name, why in failed[:10]:
