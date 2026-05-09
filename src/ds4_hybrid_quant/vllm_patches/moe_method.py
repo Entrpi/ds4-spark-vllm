@@ -252,10 +252,11 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
 
         out = torch.zeros((T, hidden), dtype=x.dtype, device=device)
 
-        # DS4_TRACE: file-toggled no-op mode. If /logs/ds4_moe_noop exists,
-        # skip the entire MoE computation and return zeros. Comparing the
-        # model output between normal and no-op modes proves whether our
-        # apply() result is actually plumbed into the residual stream.
+        # DS4_TRACE: file-toggled diagnostic modes.
+        # /logs/ds4_moe_noop exists → return zeros (no contribution)
+        # /logs/ds4_moe_passthrough exists → return x (input passes through)
+        # Comparing all three modes (normal / noop / passthrough) isolates
+        # whether the 2-bit math itself is the problem.
         import os as _os
         if _os.path.exists("/logs/ds4_moe_noop"):
             if T <= 16:
@@ -265,6 +266,14 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                     flush=True,
                 )
             return out
+        if _os.path.exists("/logs/ds4_moe_passthrough"):
+            if T <= 16:
+                print(
+                    f"[DS4_TRACE] apply() PASSTHROUGH MODE: returning x for "
+                    f"T={T} hidden={hidden}",
+                    flush=True,
+                )
+            return x.clone()
 
         # DS4_NAN_DEBUG: helper to fail fast at the first NaN/Inf and
         # report the call-site stage name. Disabled at end-to-end perf
