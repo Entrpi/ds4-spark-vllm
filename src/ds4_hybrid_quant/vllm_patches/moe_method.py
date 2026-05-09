@@ -61,6 +61,13 @@ if TYPE_CHECKING:  # pragma: no cover
 class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
     """vLLM FusedMoE method implementing the ds4 2-bit recipe."""
 
+    # DS4_LAYER_SEQ: class-level registry mapping id(layer) -> sequence
+    # index, populated in create_weights. Needed because layer.prefix and
+    # layer.layer_idx are not set on FusedMoE in our build (both None).
+    # vLLM constructs DSv4 layers 0..42 in order, so the create_weights
+    # call sequence corresponds to layer indices.
+    _ds4_layer_seq: dict = {}
+
     def __init__(self, moe: "FusedMoEConfig") -> None:
         super().__init__(moe)
         # DS4_TRACE: confirm we're being instantiated; one print per instance.
@@ -85,9 +92,19 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
     ) -> None:
         # DS4_TRACE: log every layer that gets our quant method.
         _layer_prefix = getattr(layer, "prefix", "?")
+        # Register layer id → sequence index. This mapping is the only
+        # reliable way to know which transformer layer a FusedMoE belongs
+        # to (prefix and layer_idx are unset). Construction is sequential
+        # 0..42 so seq == layer index.
+        if id(layer) not in self.__class__._ds4_layer_seq:
+            seq = len(self.__class__._ds4_layer_seq)
+            self.__class__._ds4_layer_seq[id(layer)] = seq
+        else:
+            seq = self.__class__._ds4_layer_seq[id(layer)]
+        layer._ds4_seq = seq
         print(
             f"[DS4_TRACE] create_weights inst={self._ds4_inst_id} "
-            f"layer_id={id(layer)} layer.prefix={_layer_prefix!r} "
+            f"layer_id={id(layer)} seq={seq} layer.prefix={_layer_prefix!r} "
             f"num_experts={num_experts} hidden={hidden_size} "
             f"intermediate={intermediate_size_per_partition}",
             flush=True,
@@ -478,12 +495,16 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
             import os as _os2
             if T > 1 and _os2.path.exists("/logs/ds4_dump_arm"):
                 import re as _re2
-                # layer.prefix is often '?' (no real prefix set), so fall
-                # back to layer.layer_idx (the same fallback DS4_ROUTE uses).
+                # Primary: use the layer-seq registry populated in
+                # create_weights (the only thing that actually works in
+                # our build — both prefix and layer_idx are unset).
+                _seq = getattr(layer, "_ds4_seq", None)
                 _prefix = getattr(layer, "prefix", "") or ""
                 _lidx_attr = getattr(layer, "layer_idx", None)
                 _m = _re2.search(r"layers\.(\d+)", _prefix)
-                if _lidx_attr is not None:
+                if _seq is not None:
+                    _lidx = int(_seq)
+                elif _lidx_attr is not None:
                     _lidx = int(_lidx_attr)
                 elif _m:
                     _lidx = int(_m.group(1))
