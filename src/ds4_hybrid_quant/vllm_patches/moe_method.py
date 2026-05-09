@@ -146,7 +146,9 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         # for unrecognized source names and leaves our params at empty()'s
         # uninitialized memory — manifests as fp16-max-valued garbage and
         # NaN/Inf at apply() time.
-        from vllm.model_executor.utils import default_weight_loader
+        def _passthrough_loader(param, loaded_weight):
+            param.data.copy_(loaded_weight)
+
         attrs_no_loader = {
             k: v for k, v in extra_weight_attrs.items() if k != "weight_loader"
         }
@@ -156,7 +158,7 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         ):
             param = getattr(layer, name)
             set_weight_attrs(param, attrs_no_loader)
-            param.weight_loader = default_weight_loader
+            param.weight_loader = _passthrough_loader
 
     def get_fused_moe_quant_config(
         self, layer: "nn.Module",
