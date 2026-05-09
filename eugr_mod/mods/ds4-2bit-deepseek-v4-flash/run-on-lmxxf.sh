@@ -140,6 +140,41 @@ s = s.replace(needle, inject, 1)
 open(p, 'w').write(s)
 print('[ds4] deepseek_v4.py post-load completion patched')
 PY2
+    # Outer-class load_weights diagnostic: dump lm_head + embed_tokens stats
+    # post-AutoWeightsLoader, comparing against on-disk safetensor data.
+    # This isolates whether the outer-class load actually populated those.
+    python3 - <<PY3
+p = "$DSV4_PY"
+s = open(p).read()
+needle = (
+    "        loader = AutoWeightsLoader(self, skip_substrs=[\"mtp.\"])\n"
+    "        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+)
+assert needle in s, "outer-class loader pattern not found"
+inject = (
+    "        loader = AutoWeightsLoader(self, skip_substrs=[\"mtp.\"])\n"
+    "        loaded_params = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)\n"
+    "        # DS4_HEAD_DBG: verify lm_head + embed_tokens loaded\n"
+    "        try:\n"
+    "            import torch as _t\n"
+    "            for _attr in ('lm_head', 'model'):\n"
+    "                _m = getattr(self, _attr, None)\n"
+    "                if _m is None:\n"
+    "                    continue\n"
+    "                for _name, _p in _m.named_parameters():\n"
+    "                    if 'lm_head' in _attr + '.' + _name or 'embed_tokens' in _name or _name in ('weight',) and _attr == 'lm_head':\n"
+    "                        if _t.is_floating_point(_p):\n"
+    "                            _max = float(_p.abs().max().item())\n"
+    "                            _mean = float(_p.abs().mean().item())\n"
+    "                            _nf = int((~_t.isfinite(_p)).sum().item())\n"
+    "                            print(f'[DS4_HEAD_DBG] {_attr}.{_name}: shape={tuple(_p.shape)} dtype={_p.dtype} |max|={_max:.3e} |mean|={_mean:.3e} non_finite={_nf}', flush=True)\n"
+    "        except Exception as _e:\n"
+    "            print(f'[DS4_HEAD_DBG] error: {_e!r}', flush=True)\n"
+)
+s = s.replace(needle, inject, 1)
+open(p, 'w').write(s)
+print('[ds4] deepseek_v4.py outer head-dbg patched')
+PY3
     find "$SITE_PACKAGES/vllm/model_executor/models/__pycache__" -name "deepseek_v4*" -delete 2>/dev/null || true
 fi
 
