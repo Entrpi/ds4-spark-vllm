@@ -493,48 +493,49 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         # overwrite prefill dumps as generation proceeds.
         try:
             import os as _os2
-            if T > 1 and _os2.path.exists("/logs/ds4_dump_arm"):
-                import re as _re2
-                # Primary: use the layer-seq registry populated in
-                # create_weights (the only thing that actually works in
-                # our build — both prefix and layer_idx are unset).
+            if T >= 1 and _os2.path.exists("/logs/ds4_dump_arm"):
+                # Resolve layer index (seq registry is the only thing
+                # that actually works in our build).
                 _seq = getattr(layer, "_ds4_seq", None)
-                _prefix = getattr(layer, "prefix", "") or ""
-                _lidx_attr = getattr(layer, "layer_idx", None)
-                _m = _re2.search(r"layers\.(\d+)", _prefix)
                 if _seq is not None:
                     _lidx = int(_seq)
-                elif _lidx_attr is not None:
-                    _lidx = int(_lidx_attr)
-                elif _m:
-                    _lidx = int(_m.group(1))
                 else:
                     _lidx = None
-                # Diagnostic: print on first armed call so we know HDUMP
-                # is reaching here at all (even if _lidx is None, we want
-                # to know).
+                # Per-layer call counter: C0 = first armed call (prefill),
+                # C1 = second (first decode), C2 = third (second decode), ...
+                _cseq = getattr(layer, "_ds4_hdump_cseq", 0)
+                layer._ds4_hdump_cseq = _cseq + 1
                 if not getattr(layer, "_ds4_hdump_logged", False):
                     layer._ds4_hdump_logged = True
+                    _prefix = getattr(layer, "prefix", "") or ""
                     print(
                         f"[DS4_HDUMP_ENTER] _lidx={_lidx} prefix={_prefix!r} "
-                        f"layer_idx_attr={_lidx_attr} T={T}",
+                        f"T={T} cseq={_cseq}",
                         flush=True,
                     )
                 if _lidx is not None:
                     _dir = "/logs/ds4_hdump"
                     _os2.makedirs(_dir, exist_ok=True)
-                    # Last prefill position (= T-1) — corresponds to the
-                    # logit-emitting position, the one we care about for
-                    # next-token comparison.
+                    # Dump last position. For prefill (T=14) this is the
+                    # logit-emitting position. For decode (T=1) there's
+                    # only one position.
                     _x_last = x[T - 1, :].detach().to(torch.float32).cpu().contiguous().numpy()
                     _o_last = out[T - 1, :].detach().to(torch.float32).cpu().contiguous().numpy()
-                    _x_last.tofile(f"{_dir}/vllm_in_L{_lidx}.f32")
-                    _o_last.tofile(f"{_dir}/vllm_out_L{_lidx}.f32")
+                    # Both new (with C{n}) and legacy (without) names —
+                    # legacy keeps backward compat with prior compare run.
+                    _x_last.tofile(f"{_dir}/vllm_in_L{_lidx}_C{_cseq}.f32")
+                    _o_last.tofile(f"{_dir}/vllm_out_L{_lidx}_C{_cseq}.f32")
+                    if _cseq == 0:
+                        # Also write legacy-named file (no C suffix) so
+                        # the existing compare script keeps working for
+                        # the prefill case.
+                        _x_last.tofile(f"{_dir}/vllm_in_L{_lidx}.f32")
+                        _o_last.tofile(f"{_dir}/vllm_out_L{_lidx}.f32")
                     if _lidx == 0 or _lidx == 42:
                         print(
-                            f"[DS4_HDUMP] layer={_lidx} T={T} "
-                            f"|x_last|mean={float(abs(_x_last).mean()):.3e} "
-                            f"|out_last|mean={float(abs(_o_last).mean()):.3e}",
+                            f"[DS4_HDUMP] layer={_lidx} T={T} cseq={_cseq} "
+                            f"|x|mean={float(abs(_x_last).mean()):.3e} "
+                            f"|out|mean={float(abs(_o_last).mean()):.3e}",
                             flush=True,
                         )
         except Exception as _e:
