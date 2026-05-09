@@ -478,10 +478,28 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
             import os as _os2
             if T > 1 and _os2.path.exists("/logs/ds4_dump_arm"):
                 import re as _re2
+                # layer.prefix is often '?' (no real prefix set), so fall
+                # back to layer.layer_idx (the same fallback DS4_ROUTE uses).
                 _prefix = getattr(layer, "prefix", "") or ""
+                _lidx_attr = getattr(layer, "layer_idx", None)
                 _m = _re2.search(r"layers\.(\d+)", _prefix)
-                if _m:
+                if _lidx_attr is not None:
+                    _lidx = int(_lidx_attr)
+                elif _m:
                     _lidx = int(_m.group(1))
+                else:
+                    _lidx = None
+                # Diagnostic: print on first armed call so we know HDUMP
+                # is reaching here at all (even if _lidx is None, we want
+                # to know).
+                if not getattr(layer, "_ds4_hdump_logged", False):
+                    layer._ds4_hdump_logged = True
+                    print(
+                        f"[DS4_HDUMP_ENTER] _lidx={_lidx} prefix={_prefix!r} "
+                        f"layer_idx_attr={_lidx_attr} T={T}",
+                        flush=True,
+                    )
+                if _lidx is not None:
                     _dir = "/logs/ds4_hdump"
                     _os2.makedirs(_dir, exist_ok=True)
                     # Last prefill position (= T-1) — corresponds to the
