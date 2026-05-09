@@ -288,8 +288,13 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
             try:
                 import re as _re
                 _prefix = getattr(layer, "prefix", "") or ""
-                _m = _re.search(r"\.layers\.(\d+)\.", _prefix)
-                _lidx = int(_m.group(1)) if _m else -1
+                _lidx_attr = getattr(layer, "layer_idx", None)
+                _m = _re.search(r"layers\.(\d+)", _prefix)
+                _lidx = (
+                    _lidx_attr
+                    if _lidx_attr is not None
+                    else (int(_m.group(1)) if _m else -1)
+                )
                 _tw = topk_weights.detach().float()
                 # Normalize per-token (since vLLM's topk_weights are scaled
                 # by routed_scaling_factor and don't sum to 1).
@@ -302,6 +307,13 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 # Show top-1 expert IDs across tokens (for variety check)
                 _top1 = topk_weights.argmax(dim=-1)
                 _top1_ids = topk_ids.gather(-1, _top1.unsqueeze(-1)).squeeze(-1).tolist()
+                # Once-per-layer prefix dump so we can map call→layer
+                if not getattr(layer, "_ds4_prefix_dumped", False):
+                    layer._ds4_prefix_dumped = True
+                    print(
+                        f"[DS4_ROUTE_PFX] call={_call_n} layer={_lidx} prefix={_prefix!r}",
+                        flush=True,
+                    )
                 print(
                     f"[DS4_ROUTE] call={_call_n} layer={_lidx} T={T} "
                     f"ent={_ent_mean:.3f}/{_max_ent:.3f} "
