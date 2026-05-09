@@ -45,6 +45,11 @@ except ImportError:  # pragma: no cover
 
 from ..lookup_tables import QK_K
 
+# DS4_FWD_DBG: module-level counter so apply() calls have a sequential id.
+# Useful for tracing magnitude evolution layer-by-layer during a single
+# forward pass (DSv4-Flash has 43 layers → expect 43 calls per forward).
+_apply_call_count = 0
+
 if TYPE_CHECKING:  # pragma: no cover
     from vllm.model_executor.layers.fused_moe import FusedMoE
     from vllm.model_executor.layers.fused_moe.config import (
@@ -264,6 +269,24 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
             )
             layer._ds4_dumped = True
 
+        # DS4_FWD_DBG: per-call magnitude trace, only for small batches
+        # (i.e. real inference, not profile_run dummies which use T=64+).
+        global _apply_call_count
+        _apply_call_count += 1
+        _call_n = _apply_call_count
+        if T <= 16:
+            _xfin = x[torch.isfinite(x)] if torch.is_floating_point(x) else x.float()
+            if _xfin.numel():
+                _xmax = float(_xfin.abs().max().item())
+                _xmean = float(_xfin.abs().mean().item())
+            else:
+                _xmax = _xmean = float("nan")
+            print(
+                f"[DS4_FWD #{_call_n}] T={T} hidden={hidden} |x|max={_xmax:.3e} "
+                f"|x|mean={_xmean:.3e}",
+                flush=True,
+            )
+
         _nanchk(x, "input x")
 
         # Quantize all token activations in one shot.
@@ -324,4 +347,19 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 _nanchk(out[t], f"out[t] post accum (t={t},k={k},expert={expert})")
 
         _nanchk(out, "final out")
+
+        # DS4_FWD_DBG: dump output magnitude paired with the input one above
+        if T <= 16:
+            _ofin = out[torch.isfinite(out)]
+            if _ofin.numel():
+                _omax = float(_ofin.abs().max().item())
+                _omean = float(_ofin.abs().mean().item())
+            else:
+                _omax = _omean = float("nan")
+            print(
+                f"[DS4_FWD #{_call_n}] OUT |out|max={_omax:.3e} "
+                f"|out|mean={_omean:.3e}",
+                flush=True,
+            )
+
         return out
