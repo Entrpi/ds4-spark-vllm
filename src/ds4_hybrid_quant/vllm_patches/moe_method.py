@@ -464,4 +464,41 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 flush=True,
             )
 
+        # DS4_HDUMP: hidden-state dump for layer-by-layer comparison vs ds4
+        # reference. Gated by /logs/ds4_dump_arm so it only fires during a
+        # prepared compare run. Dumps last-token row of MoE input (x) and
+        # MoE output (out) to /logs/ds4_hdump/vllm_{in,out}_L{K}.f32 — fp32
+        # raw bytes, 4096 floats per file (16 KB). 43 layers × 2 files = 86
+        # files per run, ~1.4 MB total.
+        #
+        # Layer K extracted from layer.prefix ("model.layers.K.mlp"). T > 1
+        # gates to prefill (last position = T-1), since decode (T=1) would
+        # overwrite prefill dumps as generation proceeds.
+        try:
+            import os as _os2
+            if T > 1 and _os2.path.exists("/logs/ds4_dump_arm"):
+                import re as _re2
+                _prefix = getattr(layer, "prefix", "") or ""
+                _m = _re2.search(r"layers\.(\d+)", _prefix)
+                if _m:
+                    _lidx = int(_m.group(1))
+                    _dir = "/logs/ds4_hdump"
+                    _os2.makedirs(_dir, exist_ok=True)
+                    # Last prefill position (= T-1) — corresponds to the
+                    # logit-emitting position, the one we care about for
+                    # next-token comparison.
+                    _x_last = x[T - 1, :].detach().to(torch.float32).cpu().contiguous().numpy()
+                    _o_last = out[T - 1, :].detach().to(torch.float32).cpu().contiguous().numpy()
+                    _x_last.tofile(f"{_dir}/vllm_in_L{_lidx}.f32")
+                    _o_last.tofile(f"{_dir}/vllm_out_L{_lidx}.f32")
+                    if _lidx == 0 or _lidx == 42:
+                        print(
+                            f"[DS4_HDUMP] layer={_lidx} T={T} "
+                            f"|x_last|mean={float(abs(_x_last).mean()):.3e} "
+                            f"|out_last|mean={float(abs(_o_last).mean()):.3e}",
+                            flush=True,
+                        )
+        except Exception as _e:
+            print(f"[DS4_HDUMP] error: {_e!r}", flush=True)
+
         return out
