@@ -149,6 +149,15 @@ def complete_load(
     import os
     from safetensors import safe_open
 
+    # DS4_LOAD_COMP_DBG: identify which model instance this is — if there
+    # are two calls and id(params_dict) differs, it's the MTP head's mirror
+    # instance, not the main model being re-processed.
+    print(
+        f"[DS4_LOAD_COMP_DBG] enter id(params_dict)={id(params_dict)} "
+        f"params={len(params_dict)} loaded={len(loaded_params)}",
+        flush=True,
+    )
+
     unloaded = [k for k in params_dict if k not in loaded_params]
     if not unloaded:
         print("[DS4_LOAD_COMP] nothing to do (all params loaded)", flush=True)
