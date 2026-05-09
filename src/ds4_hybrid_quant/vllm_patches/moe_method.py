@@ -218,6 +218,33 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                         f"finite_min={fmin:.4e} finite_max={fmax:.4e}"
                     )
 
+        # DS4_LOAD_DEBUG: one-shot dump on first apply() call to verify
+        # the weights actually loaded (vs uninitialized empty() memory).
+        # Compares expert 0 (sanity-checked clean on disk) to expert 254
+        # (the one that's been NaN'ing) for w13_iq2xxs_d, the most
+        # diagnostic tensor (fp16, small, all finite when correctly
+        # loaded).
+        if not getattr(layer, "_ds4_dumped", False):
+            wl = getattr(layer.w13_iq2xxs_qs, "weight_loader", None)
+            wl_name = getattr(wl, "__name__", repr(wl))
+            wl_qual = getattr(wl, "__qualname__", "?")
+            d = layer.w13_iq2xxs_d
+            d0_finite = int(torch.isfinite(d[0]).sum().item())
+            d0_max = float(d[0].abs().max().item())
+            d0_min = float(d[0].abs().min().item())
+            d254_finite = int(torch.isfinite(d[254]).sum().item())
+            d254_max = float(d[254].abs().max().item())
+            d254_min = float(d[254].abs().min().item())
+            d254_nans = int(torch.isnan(d[254]).sum().item())
+            print(
+                f"[ds4_load_dbg] weight_loader={wl_name} ({wl_qual})  "
+                f"E0: finite={d0_finite}/{d[0].numel()} |d|_min={d0_min:.3e} |d|_max={d0_max:.3e}  "
+                f"E254: finite={d254_finite}/{d[254].numel()} |d|_min={d254_min:.3e} "
+                f"|d|_max={d254_max:.3e} nans={d254_nans}",
+                flush=True,
+            )
+            layer._ds4_dumped = True
+
         _nanchk(x, "input x")
 
         # Quantize all token activations in one shot.
