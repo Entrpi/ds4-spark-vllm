@@ -146,7 +146,26 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         # for unrecognized source names and leaves our params at empty()'s
         # uninitialized memory — manifests as fp16-max-valued garbage and
         # NaN/Inf at apply() time.
-        def _passthrough_loader(param, loaded_weight):
+        def _passthrough_loader(param, loaded_weight, *args, **kwargs):
+            # DS4_LOAD_DEBUG: dump first call's view of loaded_weight to verify
+            # whether the bytes we receive are already corrupt (fastsafetensors)
+            # or whether corruption happens later (e.g. param being reset).
+            try:
+                if not getattr(_passthrough_loader, "_dumped", False):
+                    if torch.is_floating_point(loaded_weight):
+                        nf = int((~torch.isfinite(loaded_weight)).sum().item())
+                    else:
+                        nf = -1
+                    print(
+                        f"[ds4_load_dbg/loader] FIRST call: "
+                        f"param.shape={tuple(param.shape)} param.dtype={param.dtype} "
+                        f"lw.shape={tuple(loaded_weight.shape)} lw.dtype={loaded_weight.dtype} "
+                        f"non_finite_in_lw={nf} args={args} kwargs={list(kwargs.keys())}",
+                        flush=True,
+                    )
+                    _passthrough_loader._dumped = True
+            except Exception as e:
+                print(f"[ds4_load_dbg/loader] dump error: {e!r}", flush=True)
             param.data.copy_(loaded_weight)
 
         attrs_no_loader = {
