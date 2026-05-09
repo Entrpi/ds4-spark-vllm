@@ -112,79 +112,33 @@ s = s.replace(old2, new2, 1)
 open(p, "w").write(s)
 print("[ds4] deepseek_v4.py patched")
 PY
-    # Insert a one-shot post-load summary right before the final `return loaded_params`
-    # in the patched load_weights. Surfaces params that didn't get loaded — most
-    # likely cause of all-NaN activations on first real inference.
+    # Insert a post-load completion call right before `return loaded_params`.
+    # Delegates to ds4_hybrid_quant.load_completion which (a) default-inits
+    # scale/bias/norm params and (b) direct-loads from safetensor anything
+    # vLLM's standard pipeline missed (mostly fused-attn / compressor /
+    # shared-experts tensor families).
     python3 - <<PY2
 p = "$DSV4_PY"
 s = open(p).read()
 needle = "        return loaded_params\n"
 inject = (
-    "        # DS4_HYBRID_PATCH post-load summary + default-init for unloaded params.\n"
-    "        # Our converter only emits routed-expert weights + sgl-FP8 base; the\n"
-    "        # vLLM model registers some additional params (per-layer FP8 scales for\n"
-    "        # BF16 paths, indexer k-norm) that have no corresponding safetensor.\n"
-    "        # Without init these are torch.empty() garbage → all-NaN forward.\n"
+    "        # DS4_HYBRID_PATCH post-load completion\n"
     "        try:\n"
-    "            import torch as _t\n"
-    "            unloaded = [k for k in params_dict if k not in loaded_params]\n"
-    "            # Bucket by suffix pattern\n"
-    "            _bucket = {}\n"
-    "            for k in unloaded:\n"
-    "                if k.endswith('.weight_scale_inv') or k.endswith('.weight_scale') or k.endswith('.scale'):\n"
-    "                    _bucket.setdefault('scale->1.0', []).append(k)\n"
-    "                elif k.endswith('.bias'):\n"
-    "                    _bucket.setdefault('bias->0.0', []).append(k)\n"
-    "                elif k.endswith('_norm.weight') or k.endswith('norm.weight'):\n"
-    "                    _bucket.setdefault('norm.weight->1.0', []).append(k)\n"
-    "                else:\n"
-    "                    _bucket.setdefault('OTHER (no default)', []).append(k)\n"
-    "            print(f'[DS4_LOAD_SUMMARY] params_dict={len(params_dict)} loaded={len(loaded_params)} unloaded={len(unloaded)}', flush=True)\n"
-    "            # Sample key formats to disambiguate prefix expectations\n"
-    "            _sample_pd = list(params_dict.keys())[:20]\n"
-    "            _sample_lp = list(loaded_params)[:10]\n"
-    "            _has_model_prefix_pd = sum(1 for k in params_dict if k.startswith('model.')) / max(len(params_dict),1)\n"
-    "            print(f'[DS4_LOAD_SUMMARY] params_dict model.-prefix fraction: {_has_model_prefix_pd:.2f}', flush=True)\n"
-    "            print(f'[DS4_LOAD_SUMMARY] sample params_dict keys: {_sample_pd}', flush=True)\n"
-    "            print(f'[DS4_LOAD_SUMMARY] sample loaded keys: {_sample_lp}', flush=True)\n"
-    "            # Also dump compressor/fused-* unloaded sample to see exact key format\n"
-    "            _comp = [k for k in unloaded if 'compressor' in k or 'fused_w' in k][:5]\n"
-    "            print(f'[DS4_LOAD_SUMMARY] sample unloaded compressor/fused: {_comp}', flush=True)\n"
-    "            for cat, ks in _bucket.items():\n"
-    "                print(f'[DS4_LOAD_SUMMARY] bucket {cat!r}: {len(ks)} params; sample: {ks[:3]}', flush=True)\n"
-    "            # Initialize\n"
-    "            with _t.no_grad():\n"
-    "                for k in unloaded:\n"
-    "                    pp = params_dict[k]\n"
-    "                    if k.endswith('.weight_scale_inv') or k.endswith('.weight_scale') or k.endswith('.scale'):\n"
-    "                        pp.data.fill_(1.0)\n"
-    "                        loaded_params.add(k)\n"
-    "                    elif k.endswith('.bias'):\n"
-    "                        pp.data.zero_()\n"
-    "                        loaded_params.add(k)\n"
-    "                    elif k.endswith('_norm.weight') or k.endswith('norm.weight'):\n"
-    "                        pp.data.fill_(1.0)\n"
-    "                        loaded_params.add(k)\n"
-    "            still_unloaded = [k for k in params_dict if k not in loaded_params]\n"
-    "            print(f'[DS4_LOAD_SUMMARY] after default-init still_unloaded={len(still_unloaded)}', flush=True)\n"
-    "            # Bucket still-unloaded by suffix-stem to see patterns at a glance\n"
-    "            _stems = {}\n"
-    "            for k in still_unloaded:\n"
-    "                # last 2 dot-segments as stem (e.g. 'hc_attn_fn', 'hc_ffn_scale')\n"
-    "                parts = k.split('.')\n"
-    "                stem = '.'.join(parts[-2:]) if len(parts) >= 2 else k\n"
-    "                _stems.setdefault(stem, []).append(k)\n"
-    "            for stem in sorted(_stems, key=lambda x: -len(_stems[x])):\n"
-    "                pp = params_dict[_stems[stem][0]]\n"
-    "                print(f'[DS4_LOAD_SUMMARY] STEM {stem!r}: {len(_stems[stem])} params, e.g. {_stems[stem][0]} shape={tuple(pp.shape)} dtype={pp.dtype}', flush=True)\n"
+    "            import os as _os\n"
+    "            from ds4_hybrid_quant.load_completion import complete_load\n"
+    "            complete_load(\n"
+    "                params_dict, loaded_params,\n"
+    "                ckpt_dir=_os.environ.get('DS4_CKPT_DIR', '/models/deepseek-v4-flash-ds4-q2'),\n"
+    "            )\n"
     "        except Exception as _e:\n"
-    "            print(f'[DS4_LOAD_SUMMARY] dump error: {_e!r}', flush=True)\n"
+    "            print(f'[DS4_LOAD_COMP] FAILED: {_e!r}', flush=True)\n"
+    "            import traceback as _tb; _tb.print_exc()\n"
     "        return loaded_params\n"
 )
 assert needle in s, "expected 'return loaded_params' line not found"
 s = s.replace(needle, inject, 1)
 open(p, 'w').write(s)
-print('[ds4] deepseek_v4.py post-load summary patched')
+print('[ds4] deepseek_v4.py post-load completion patched')
 PY2
     find "$SITE_PACKAGES/vllm/model_executor/models/__pycache__" -name "deepseek_v4*" -delete 2>/dev/null || true
 fi
