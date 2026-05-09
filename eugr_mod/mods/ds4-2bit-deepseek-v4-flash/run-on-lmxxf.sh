@@ -61,12 +61,16 @@ assert old in s, "expected pattern not found in deepseek_v4.py"
 s = s.replace(old, new, 1)
 old2 = '                    loaded_params.add(name_mapped)\n                    continue\n'
 new2 = (
+    '                    if "iq2xxs" in name or "q2k" in name:  # DS4_HYBRID_PATCH dbg\n'
+    '                        print(f"[DS4_FT_DBG] name={name!r} name_mapped={name_mapped!r} skip={skip_expert_weight} in_pdict={name in params_dict}", flush=True)\n'
     '                    if name_mapped is None:  # DS4_HYBRID_PATCH\n'
     '                        if name in params_dict:\n'
     '                            param = params_dict[name]\n'
     '                            weight_loader = getattr(param, "weight_loader", default_weight_loader)\n'
     '                            weight_loader(param, loaded_weight)\n'
     '                            loaded_params.add(name)\n'
+    '                            if "iq2xxs" in name or "q2k" in name:  # DS4_HYBRID_PATCH dbg\n'
+    '                                print(f"[DS4_FT_DBG] FALLTHROUGH LOAD ok for {name!r}", flush=True)\n'
     '                        continue\n'
     '                    loaded_params.add(name_mapped)\n'
     '                    continue\n'
