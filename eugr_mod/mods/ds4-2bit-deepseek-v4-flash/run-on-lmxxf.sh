@@ -90,6 +90,35 @@ s = s.replace(old2, new2, 1)
 open(p, "w").write(s)
 print("[ds4] deepseek_v4.py patched")
 PY
+    # Insert a one-shot post-load summary right before the final `return loaded_params`
+    # in the patched load_weights. Surfaces params that didn't get loaded — most
+    # likely cause of all-NaN activations on first real inference.
+    python3 - <<PY2
+p = "$DSV4_PY"
+s = open(p).read()
+needle = "        return loaded_params\n"
+inject = (
+    "        # DS4_HYBRID_PATCH post-load summary\n"
+    "        try:\n"
+    "            import torch as _t\n"
+    "            unloaded = [k for k in params_dict if k not in loaded_params]\n"
+    "            print(f'[DS4_LOAD_SUMMARY] params_dict={len(params_dict)} loaded={len(loaded_params)} unloaded={len(unloaded)}', flush=True)\n"
+    "            for k in unloaded[:80]:\n"
+    "                pp = params_dict[k]\n"
+    "                if _t.is_floating_point(pp):\n"
+    "                    nf = int((~_t.isfinite(pp)).sum().item())\n"
+    "                    print(f'[DS4_LOAD_SUMMARY] UNLOADED {k} shape={tuple(pp.shape)} dtype={pp.dtype} non_finite={nf}/{pp.numel()}', flush=True)\n"
+    "                else:\n"
+    "                    print(f'[DS4_LOAD_SUMMARY] UNLOADED {k} shape={tuple(pp.shape)} dtype={pp.dtype}', flush=True)\n"
+    "        except Exception as _e:\n"
+    "            print(f'[DS4_LOAD_SUMMARY] dump error: {_e!r}', flush=True)\n"
+    "        return loaded_params\n"
+)
+assert needle in s, "expected 'return loaded_params' line not found"
+s = s.replace(needle, inject, 1)
+open(p, 'w').write(s)
+print('[ds4] deepseek_v4.py post-load summary patched')
+PY2
     find "$SITE_PACKAGES/vllm/model_executor/models/__pycache__" -name "deepseek_v4*" -delete 2>/dev/null || true
 fi
 
