@@ -63,6 +63,12 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
 
     def __init__(self, moe: "FusedMoEConfig") -> None:
         super().__init__(moe)
+        # DS4_TRACE: confirm we're being instantiated; one print per instance.
+        self._ds4_inst_id = id(self)
+        print(
+            f"[DS4_TRACE] __init__ Iq2XxsQ2KFusedMoEMethod inst_id={self._ds4_inst_id}",
+            flush=True,
+        )
 
     # ------------------------------------------------------------------
     # Weight registration
@@ -77,6 +83,15 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         params_dtype: "torch.dtype",
         **extra_weight_attrs,
     ) -> None:
+        # DS4_TRACE: log every layer that gets our quant method.
+        _layer_prefix = getattr(layer, "prefix", "?")
+        print(
+            f"[DS4_TRACE] create_weights inst={self._ds4_inst_id} "
+            f"layer_id={id(layer)} layer.prefix={_layer_prefix!r} "
+            f"num_experts={num_experts} hidden={hidden_size} "
+            f"intermediate={intermediate_size_per_partition}",
+            flush=True,
+        )
         if hidden_size % QK_K != 0:
             raise ValueError(
                 f"hidden_size {hidden_size} must be a multiple of {QK_K}"
@@ -223,7 +238,33 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         n_blocks_in = hidden // QK_K
         n_blocks_int = intermediate // QK_K
 
+        # DS4_TRACE: first-call-per-layer marker — proves apply() is reaching
+        # this specific FusedMoE instance.
+        if not getattr(layer, "_ds4_apply_first_logged", False):
+            layer._ds4_apply_first_logged = True
+            print(
+                f"[DS4_TRACE] apply() FIRST inst={self._ds4_inst_id} "
+                f"layer_id={id(layer)} layer.prefix={getattr(layer, 'prefix', '?')!r} "
+                f"x.shape={tuple(x.shape)} x.dtype={x.dtype} "
+                f"topk_ids.shape={tuple(topk_ids.shape)}",
+                flush=True,
+            )
+
         out = torch.zeros((T, hidden), dtype=x.dtype, device=device)
+
+        # DS4_TRACE: file-toggled no-op mode. If /logs/ds4_moe_noop exists,
+        # skip the entire MoE computation and return zeros. Comparing the
+        # model output between normal and no-op modes proves whether our
+        # apply() result is actually plumbed into the residual stream.
+        import os as _os
+        if _os.path.exists("/logs/ds4_moe_noop"):
+            if T <= 16:
+                print(
+                    f"[DS4_TRACE] apply() NOOP MODE: returning zeros for "
+                    f"T={T} hidden={hidden}",
+                    flush=True,
+                )
+            return out
 
         # DS4_NAN_DEBUG: helper to fail fast at the first NaN/Inf and
         # report the call-site stage name. Disabled at end-to-end perf
@@ -397,7 +438,9 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
 
         _nanchk(out, "final out")
 
-        # DS4_FWD_DBG: dump output magnitude paired with the input one above
+        # DS4_FWD_DBG: dump output magnitude paired with the input one above.
+        # Plus a checksum (sum of squares of float32 values) so we can detect
+        # whether two calls with the same input produce the same output.
         if T <= 16:
             _ofin = out[torch.isfinite(out)]
             if _ofin.numel():
@@ -405,9 +448,10 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 _omean = float(_ofin.abs().mean().item())
             else:
                 _omax = _omean = float("nan")
+            _ocksum = float(out.float().pow(2).sum().item())
             print(
                 f"[DS4_FWD #{_call_n}] OUT |out|max={_omax:.3e} "
-                f"|out|mean={_omean:.3e}",
+                f"|out|mean={_omean:.3e} sum2={_ocksum:.6e}",
                 flush=True,
             )
 
