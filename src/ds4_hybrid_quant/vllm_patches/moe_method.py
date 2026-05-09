@@ -274,6 +274,29 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         global _apply_call_count
         _apply_call_count += 1
         _call_n = _apply_call_count
+        # DS4_TOPK_DBG: one-shot dump of topk routing values from the
+        # first 3 small-T calls (covers prefill + first 2 decode steps),
+        # to verify gate output is sensible.
+        if T <= 16 and getattr(layer, "_ds4_topk_dumped", 0) < 3:
+            layer._ds4_topk_dumped = getattr(layer, "_ds4_topk_dumped", 0) + 1
+            try:
+                _ti = topk_ids.detach().cpu()
+                _tw = topk_weights.detach().float().cpu()
+                print(
+                    f"[DS4_TOPK_DBG] call={_call_n} T={T} top_k={top_k} "
+                    f"topk_ids.shape={tuple(_ti.shape)} dtype={_ti.dtype}",
+                    flush=True,
+                )
+                for _row in range(min(_ti.shape[0], 4)):
+                    _ids = _ti[_row].tolist()
+                    _wts = [round(float(v), 4) for v in _tw[_row].tolist()]
+                    _wsum = float(_tw[_row].sum().item())
+                    print(
+                        f"[DS4_TOPK_DBG] tok={_row} ids={_ids} wts={_wts} sum={_wsum:.4f}",
+                        flush=True,
+                    )
+            except Exception as _e:
+                print(f"[DS4_TOPK_DBG] error: {_e!r}", flush=True)
         if T <= 16:
             _xfin = x[torch.isfinite(x)] if torch.is_floating_point(x) else x.float()
             if _xfin.numel():
