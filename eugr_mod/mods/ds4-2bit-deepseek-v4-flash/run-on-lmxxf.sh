@@ -54,14 +54,36 @@ old = (
 )
 new = (
     '                    name_mapped = None  # DS4_HYBRID_PATCH\n'
+    '                    _ds4_load_succeeded = False  # DS4_HYBRID_PATCH\n'
     '                    for mapping in expert_mapping:\n'
     '                        param_name, weight_name, expert_id, shard_id = mapping\n'
 )
 assert old in s, "expected pattern not found in deepseek_v4.py"
 s = s.replace(old, new, 1)
+
+# Track whether the inner expert_mapping loop's loader actually succeeded.
+# Without this, name_mapped gets set by ANY mapping whose weight_name is a
+# substring of our 2-bit tensor names (e.g. "scales" matches w2_q2k_scales),
+# the FusedMoE per-expert loader returns success=False, but our fall-through
+# was gated on name_mapped is None — so it didn't fire and the param went
+# unloaded.
+old_succ = (
+    '                        if success:\n'
+    '                            name = name_mapped\n'
+    '                            break\n'
+)
+new_succ = (
+    '                        if success:\n'
+    '                            _ds4_load_succeeded = True  # DS4_HYBRID_PATCH\n'
+    '                            name = name_mapped\n'
+    '                            break\n'
+)
+assert old_succ in s, "expected 'if success' block not found"
+s = s.replace(old_succ, new_succ, 1)
+
 old2 = '                    loaded_params.add(name_mapped)\n                    continue\n'
 new2 = (
-    '                    if name_mapped is None:  # DS4_HYBRID_PATCH\n'
+    '                    if not _ds4_load_succeeded:  # DS4_HYBRID_PATCH\n'
     '                        # safetensor names may have had a "model." prefix stripped\n'
     '                        # by an upstream WeightsMapper; AND our converter used\n'
     '                        # mlp.experts.* while DSv4-Flash uses ffn.experts.* in\n'
@@ -135,9 +157,16 @@ inject = (
     "                        loaded_params.add(k)\n"
     "            still_unloaded = [k for k in params_dict if k not in loaded_params]\n"
     "            print(f'[DS4_LOAD_SUMMARY] after default-init still_unloaded={len(still_unloaded)}', flush=True)\n"
-    "            for k in still_unloaded[:30]:\n"
-    "                pp = params_dict[k]\n"
-    "                print(f'[DS4_LOAD_SUMMARY] STILL UNLOADED {k} shape={tuple(pp.shape)} dtype={pp.dtype}', flush=True)\n"
+    "            # Bucket still-unloaded by suffix-stem to see patterns at a glance\n"
+    "            _stems = {}\n"
+    "            for k in still_unloaded:\n"
+    "                # last 2 dot-segments as stem (e.g. 'hc_attn_fn', 'hc_ffn_scale')\n"
+    "                parts = k.split('.')\n"
+    "                stem = '.'.join(parts[-2:]) if len(parts) >= 2 else k\n"
+    "                _stems.setdefault(stem, []).append(k)\n"
+    "            for stem in sorted(_stems, key=lambda x: -len(_stems[x])):\n"
+    "                pp = params_dict[_stems[stem][0]]\n"
+    "                print(f'[DS4_LOAD_SUMMARY] STEM {stem!r}: {len(_stems[stem])} params, e.g. {_stems[stem][0]} shape={tuple(pp.shape)} dtype={pp.dtype}', flush=True)\n"
     "        except Exception as _e:\n"
     "            print(f'[DS4_LOAD_SUMMARY] dump error: {_e!r}', flush=True)\n"
     "        return loaded_params\n"
