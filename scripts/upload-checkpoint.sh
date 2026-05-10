@@ -9,7 +9,7 @@
 #                                [--meta-dir PATH]   [--private] [--dry-run]
 #
 # Defaults:
-#   --repo       bleysg/DeepSeek-V4-Flash-IQ2XXS-Q2K-FP8
+#   --repo       bleysg/DeepSeek-V4-Flash-IQ2XXS-Q2K-FP8-120GB-target
 #   --model-dir  /home/ent/models/deepseek-v4-flash-ds4-q2
 #   --meta-dir   <repo>/local/distribution
 #   --private    (off — public by default)
@@ -33,7 +33,7 @@
 set -euo pipefail
 
 # --- defaults --------------------------------------------------------------
-HF_REPO="${HF_REPO:-bleysg/DeepSeek-V4-Flash-IQ2XXS-Q2K-FP8}"
+HF_REPO="${HF_REPO:-bleysg/DeepSeek-V4-Flash-IQ2XXS-Q2K-FP8-120GB-target}"
 MODEL_DIR="${MODEL_DIR:-/home/ent/models/deepseek-v4-flash-ds4-q2}"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
