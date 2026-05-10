@@ -427,17 +427,20 @@ assert old_import in s, "expected exact import block in single_type_kv_cache_man
 s = s.replace(old_import, new_import, 1)
 
 # 2. Add CompressorStateMLASpec to spec_manager_map dispatch dict.
+# NOTE: lmxxf base image uses the older vllm where MLA specs reuse
+# SlidingWindowManager / FullAttentionManager (no MLA-specific manager
+# classes). Match THAT layout, not the local fork's newer layout.
 old_map = (
-    "    SlidingWindowMLASpec: SlidingWindowMLAManager,\n"
+    "    SlidingWindowMLASpec: SlidingWindowManager,\n"
     "    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,"
 )
 new_map = (
-    "    SlidingWindowMLASpec: SlidingWindowMLAManager,\n"
+    "    SlidingWindowMLASpec: SlidingWindowManager,\n"
     "    # DS4_KV_PATCH_V3: CompressorStateMLASpec is a subclass of\n"
     "    # SlidingWindowMLASpec; spec_manager_map uses exact-type lookup so\n"
-    "    # the entry is required. Reuses SlidingWindowMLAManager (only the\n"
+    "    # the entry is required. Reuses SlidingWindowManager (only the\n"
     "    # admission bound differs, computed via the spec method).\n"
-    "    CompressorStateMLASpec: SlidingWindowMLAManager,\n"
+    "    CompressorStateMLASpec: SlidingWindowManager,\n"
     "    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,"
 )
 assert old_map in s, "expected exact spec_manager_map block"
