@@ -209,6 +209,101 @@ PY3
     find "$SITE_PACKAGES/vllm/model_executor/models/__pycache__" -name "deepseek_v4*" -delete 2>/dev/null || true
 fi
 
+# KV cache compressor-state spec fix.
+# Vanilla SlidingWindowMLASpec bounds admission by max_num_batched_tokens, so
+# the DSv4 compressor state cache (a fixed-size state-space model with a
+# sliding_window of 8 or 128 tokens) gets sized as if it could hold up to
+# max_num_batched_tokens worth of uncompressed state. For V4-Flash at
+# max_model_len=16384, that's ~16 GiB of compressor state vs the ~50 MiB
+# actually needed. Subclassing to bound by sliding_window only drops the
+# pool to its architectural floor; pairs with the V4 paper §3.5.1 description
+# of the state cache as a state-space model.
+KV_INTERFACE_PY="$SITE_PACKAGES/vllm/v1/kv_cache_interface.py"
+DEEPSEEK_COMPRESSOR_PY="$SITE_PACKAGES/vllm/model_executor/layers/deepseek_compressor.py"
+if ! grep -q "DS4_KV_PATCH_V1" "$KV_INTERFACE_PY"; then
+    echo "[ds4] Patching KV cache compressor-state spec (~300x over-allocation fix)"
+    python3 - <<PY_KV
+import os
+kv_p = "$KV_INTERFACE_PY"
+comp_p = "$DEEPSEEK_COMPRESSOR_PY"
+
+# 1. Append CompressorStateMLASpec to kv_cache_interface.py.
+s = open(kv_p).read()
+assert "class SlidingWindowMLASpec(SlidingWindowSpec):" in s, \
+    "expected SlidingWindowMLASpec class in kv_cache_interface.py"
+assert "DS4_KV_PATCH_V1" not in s, "patch already applied (kv_cache_interface)"
+new_class = '''
+
+
+@dataclass(frozen=True, kw_only=True)
+class CompressorStateMLASpec(SlidingWindowMLASpec):
+    """DS4_KV_PATCH_V1 — DeepseekV4 compressor state cache spec.
+
+    Vanilla SlidingWindowSpec.max_admission_blocks_per_request bounds by
+    min(sliding_window - 1 + max_num_batched_tokens, max_model_len), under
+    the chunked-prefill assumption that the cache may transiently hold up
+    to max_num_batched_tokens uncompressed tokens. The DSv4 compressor
+    state is a fixed-size state-space model (paper §3.5.1: "regarded as a
+    sequence-specific state that depends solely on the current position")
+    — it never holds more than sliding_window tokens regardless of batch
+    size. Bounding by sliding_window drops the per-request startup budget
+    by ~1300x for CSA (sliding_window=8, block_size=4) and ~120x for HCA
+    (sliding_window=128, block_size=8).
+    """
+
+    def max_admission_blocks_per_request(
+        self, max_num_batched_tokens: int, max_model_len: int
+    ) -> int:
+        # +1 because the window may not start from a block boundary,
+        # same convention as the parent class.
+        return cdiv(self.sliding_window, self.block_size) + 1
+'''
+# Append at end of file (idempotent: check via DS4_KV_PATCH_V1 marker above).
+with open(kv_p, "w") as f:
+    f.write(s.rstrip() + new_class + "\n")
+print("[ds4] kv_cache_interface.py: CompressorStateMLASpec appended")
+
+# 2. Wire CompressorStateCache.get_kv_cache_spec to use it.
+s = open(comp_p).read()
+assert "DS4_KV_PATCH_V1" not in s, "patch already applied (deepseek_compressor)"
+old_import = (
+    "from vllm.v1.kv_cache_interface import (\n"
+    "    KVCacheSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    ")"
+)
+new_import = (
+    "from vllm.v1.kv_cache_interface import (  # DS4_KV_PATCH_V1\n"
+    "    CompressorStateMLASpec,\n"
+    "    KVCacheSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    ")"
+)
+assert old_import in s, "expected exact import block in deepseek_compressor.py"
+s = s.replace(old_import, new_import, 1)
+
+old_call = "return SlidingWindowMLASpec(  # only has one vector instead of K + V"
+new_call = "return CompressorStateMLASpec(  # DS4_KV_PATCH_V1 (was SlidingWindowMLASpec) only has one vector instead of K + V"
+assert old_call in s, "expected SlidingWindowMLASpec construction in CompressorStateCache.get_kv_cache_spec"
+s = s.replace(old_call, new_call, 1)
+
+with open(comp_p, "w") as f:
+    f.write(s)
+print("[ds4] deepseek_compressor.py: CompressorStateCache.get_kv_cache_spec rewired")
+
+# 3. Wipe pycache so the patches load on next import.
+import shutil
+for d in ("$SITE_PACKAGES/vllm/v1/__pycache__",
+          "$SITE_PACKAGES/vllm/model_executor/layers/__pycache__"):
+    for f in os.listdir(d) if os.path.isdir(d) else []:
+        if "kv_cache_interface" in f or "deepseek_compressor" in f:
+            os.remove(os.path.join(d, f))
+print("[ds4] KV cache patches applied; pycache wiped for affected modules")
+PY_KV
+fi
+
 # Sanity-check our quant config registered.
 python3 - <<'PY'
 from vllm.model_executor.layers.quantization import (
