@@ -57,7 +57,30 @@ self-inflicted:
 - Modded image `vllm-ds4-flash:latest` retained
 - `vllm-ds4` container removed
 
-## How to resume (when HC kernel ready)
+## Working configuration (verified 2026-05-10)
+
+DSv4-Flash 2-bit hybrid is fully working on Spark via vLLM. Two correctness
+bugs were found and fixed:
+
+1. **Norm-loading bug** in `load_completion.py`: `*_norm.weight` params were
+   defaulted to 1.0 in Phase 1 *before* Phase 2's remap rules saw them, so
+   trained FFN/attn-norm scales were never loaded. Symptom: layer 0 input
+   to MoE had `‖x‖≈√hidden=64` instead of trained `≈15`. Fixed by
+   reordering phases (direct-load first, default-init only what truly
+   isn't on disk) and adding remap rules for `attn_norm.weight`,
+   `ffn_norm.weight`, `attn.kv_norm.weight`, `attn.q_norm.weight`.
+
+2. **Decode-kernel bug** on SM12x (consumer Blackwell): the triton
+   `matmul_sparse_mla_attention_with_sink` path used by
+   `_forward_sparse_mla_compressed_decode_triton` (for layers with
+   `compress_ratio≥4`) produces wrong output on SM12x. Layers 0-1
+   (`compress_ratio=1`, SWA-only) decode correctly; layer 2+ (with
+   compressor+indexer) decode wrong. Symptom: vllm-internal compare of
+   `decode-pos14` vs `15tok-prefill-pos14` showed L0/L1 bit-identical,
+   L2 first divergence at cos=0.91. Workaround: set
+   `VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0` to use the
+   `fp8ds_global_paged_sparse_mla_attention_with_sink_multihead`
+   path instead.
 
 ```bash
 # On Spark, with modded image already built and checkpoint already converted:
@@ -67,19 +90,24 @@ docker run -d --gpus all --name vllm-ds4 --network host \
   -v /home/ent/logs:/logs -v /home/ent/extras:/extras \
   -e DG_LOCAL=/extras/DeepGEMM \
   -e LD_PRELOAD=/usr/local/cuda/lib64/libnvrtc.so \
-  --entrypoint bash vllm-ds4-flash:latest \
-  -c "bash /work/eugr_mod/mods/ds4-2bit-deepseek-v4-flash/run.sh > /logs/serve-mod.log 2>&1 && \
+  -e VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0 \
+  --entrypoint bash lmxxf/vllm-deepseek-v4-dgx-spark:latest \
+  -c "bash /work/eugr_mod/mods/ds4-2bit-deepseek-v4-flash/run-on-lmxxf.sh > /logs/serve-mod.log 2>&1 && \
       vllm serve /models/deepseek-v4-flash-ds4-q2 \
         --served-model-name dsv4 --quantization deepseek_v4_hybrid_iq2 \
         --port 8000 --host 0.0.0.0 \
-        --max-model-len 16384 --gpu-memory-utilization 0.85 \
+        --max-model-len 4096 --gpu-memory-utilization 0.85 \
         --kv-cache-dtype fp8 --attention-backend FLASHINFER \
-        --load-format fastsafetensors --enforce-eager 2>&1 | tee /logs/serve.log"
+        --enforce-eager 2>&1 | tee /logs/serve.log"
 ```
 
-Once HC works, the next checks are (a) does it reach "Application startup
-complete", (b) does `curl localhost:8000/v1/completions` return coherent
-text, (c) logit-parity vs ds4 on antirez's test vectors.
+Validation:
+- Iterative prefill produces 20+ coherent tokens matching ds4 reference.
+- Single-call generation: `curl -d '{"prompt":"The capital of France is","max_tokens":30}'` →
+  `'We are asked: "The capital of France is". This is a simple factual
+  question. The capital of France is Paris. So the answer should be'`.
+- Math: `12 × 7` correctly computed as 84.
+- Code completion produces sensible Python.
 
 ## Next paths (in order of recommendation)
 
