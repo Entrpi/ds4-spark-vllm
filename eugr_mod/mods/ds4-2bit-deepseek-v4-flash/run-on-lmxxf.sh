@@ -374,6 +374,90 @@ print("[ds4] DS4_KV_PATCH_V2 applied; pycache wiped")
 PY_KV2
 fi
 
+# KV cache spec_manager_map registration fix (Patch V3).
+# Without this, the new CompressorStateMLASpec subclass introduced by V1
+# triggers a KeyError during EngineCore startup because spec_manager_map uses
+# exact-type lookup (`type(spec)`) rather than isinstance — so the subclass
+# isn't dispatched to SlidingWindowMLAManager. The KeyError kills the engine
+# core silently, the API server times out and exits 0, and the container
+# enters a restart loop. V1 + V2 looked fine in startup logs (KV cache pool
+# numbers were emitted before the crash) but the engine never actually
+# served — the reported concurrency improvements were mid-startup ghost
+# numbers.
+SINGLE_TYPE_MGR_PY="$SITE_PACKAGES/vllm/v1/core/single_type_kv_cache_manager.py"
+if ! grep -q "DS4_KV_PATCH_V3" "$SINGLE_TYPE_MGR_PY"; then
+    echo "[ds4] Patching spec_manager_map to register CompressorStateMLASpec"
+    python3 - <<PY_KV3
+mgr_p = "$SINGLE_TYPE_MGR_PY"
+
+s = open(mgr_p).read()
+assert "DS4_KV_PATCH_V3" not in s, "patch already applied (single_type_kv_cache_manager)"
+
+# 1. Add CompressorStateMLASpec to the import.
+old_import = (
+    "from vllm.v1.kv_cache_interface import (\n"
+    "    ChunkedLocalAttentionSpec,\n"
+    "    CrossAttentionSpec,\n"
+    "    FullAttentionSpec,\n"
+    "    KVCacheSpec,\n"
+    "    MambaSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SinkFullAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    "    SlidingWindowSpec,\n"
+    "    TQFullAttentionSpec,\n"
+    ")"
+)
+new_import = (
+    "from vllm.v1.kv_cache_interface import (  # DS4_KV_PATCH_V3\n"
+    "    ChunkedLocalAttentionSpec,\n"
+    "    CompressorStateMLASpec,\n"
+    "    CrossAttentionSpec,\n"
+    "    FullAttentionSpec,\n"
+    "    KVCacheSpec,\n"
+    "    MambaSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SinkFullAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    "    SlidingWindowSpec,\n"
+    "    TQFullAttentionSpec,\n"
+    ")"
+)
+assert old_import in s, "expected exact import block in single_type_kv_cache_manager.py"
+s = s.replace(old_import, new_import, 1)
+
+# 2. Add CompressorStateMLASpec to spec_manager_map dispatch dict.
+old_map = (
+    "    SlidingWindowMLASpec: SlidingWindowMLAManager,\n"
+    "    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,"
+)
+new_map = (
+    "    SlidingWindowMLASpec: SlidingWindowMLAManager,\n"
+    "    # DS4_KV_PATCH_V3: CompressorStateMLASpec is a subclass of\n"
+    "    # SlidingWindowMLASpec; spec_manager_map uses exact-type lookup so\n"
+    "    # the entry is required. Reuses SlidingWindowMLAManager (only the\n"
+    "    # admission bound differs, computed via the spec method).\n"
+    "    CompressorStateMLASpec: SlidingWindowMLAManager,\n"
+    "    ChunkedLocalAttentionSpec: ChunkedLocalAttentionManager,"
+)
+assert old_map in s, "expected exact spec_manager_map block"
+s = s.replace(old_map, new_map, 1)
+
+with open(mgr_p, "w") as f:
+    f.write(s)
+print("[ds4] single_type_kv_cache_manager.py: CompressorStateMLASpec registered")
+
+# 3. Wipe pycache so the patch loads on next import.
+import os
+d = "$SITE_PACKAGES/vllm/v1/core/__pycache__"
+if os.path.isdir(d):
+    for f in os.listdir(d):
+        if "single_type_kv_cache_manager" in f:
+            os.remove(os.path.join(d, f))
+print("[ds4] DS4_KV_PATCH_V3 applied; pycache wiped")
+PY_KV3
+fi
+
 # Sanity-check our quant config registered.
 python3 - <<'PY'
 from vllm.model_executor.layers.quantization import (
