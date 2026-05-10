@@ -304,6 +304,76 @@ print("[ds4] KV cache patches applied; pycache wiped for affected modules")
 PY_KV
 fi
 
+# KV cache SWA spec fix (Patch 2 in the V4 KV-layout series).
+# DeepseekV4SWACache.get_kv_cache_spec returned vanilla SlidingWindowMLASpec,
+# inheriting the same max_num_batched_tokens-based admission bound the C4/C128
+# compressor states had pre-DS4_KV_PATCH_V1. The SWA cache is the same shape of
+# bug: it's a fixed-size sliding-window buffer (sliding_window=128 tokens) but
+# was sized as if it could transiently hold up to max_num_batched_tokens. With
+# 43 SWA cache instances and 257 blocks/request × 37,440 B/block per instance,
+# this contributes ~395 MiB per request — the dominant remaining KV
+# over-allocation contributor after V1 (paper §3.5.1).
+SPARSE_SWA_PY="$SITE_PACKAGES/vllm/v1/attention/backends/mla/sparse_swa.py"
+if ! grep -q "DS4_KV_PATCH_V2" "$SPARSE_SWA_PY"; then
+    echo "[ds4] Patching DeepseekV4SWACache spec (~85x SWA over-allocation fix)"
+    python3 - <<PY_KV2
+sw_p = "$SPARSE_SWA_PY"
+
+s = open(sw_p).read()
+assert "DS4_KV_PATCH_V2" not in s, "patch already applied (sparse_swa)"
+
+# 1. Add CompressorStateMLASpec to the import.
+old_import = (
+    "from vllm.v1.kv_cache_interface import (\n"
+    "    AttentionSpec,\n"
+    "    KVCacheSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    ")"
+)
+new_import = (
+    "from vllm.v1.kv_cache_interface import (  # DS4_KV_PATCH_V2\n"
+    "    AttentionSpec,\n"
+    "    CompressorStateMLASpec,\n"
+    "    KVCacheSpec,\n"
+    "    MLAAttentionSpec,\n"
+    "    SlidingWindowMLASpec,\n"
+    ")"
+)
+assert old_import in s, "expected exact import block in sparse_swa.py"
+s = s.replace(old_import, new_import, 1)
+
+# 2. Swap SlidingWindowMLASpec -> CompressorStateMLASpec in
+#    DeepseekV4SWACache.get_kv_cache_spec.
+old_call = (
+    "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n"
+    "        return SlidingWindowMLASpec(\n"
+)
+new_call = (
+    "    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:\n"
+    "        # DS4_KV_PATCH_V2: SWA cache is a fixed-size sliding-window state\n"
+    "        # buffer (paper section 3.5.1); bound admission by sliding_window\n"
+    "        # only via CompressorStateMLASpec. ~85x SWA over-allocation fix.\n"
+    "        return CompressorStateMLASpec(\n"
+)
+assert old_call in s, "expected DeepseekV4SWACache.get_kv_cache_spec to return SlidingWindowMLASpec"
+s = s.replace(old_call, new_call, 1)
+
+with open(sw_p, "w") as f:
+    f.write(s)
+print("[ds4] sparse_swa.py: DeepseekV4SWACache.get_kv_cache_spec rewired")
+
+# 3. Wipe pycache so the patch loads on next import.
+import os
+d = "$SITE_PACKAGES/vllm/v1/attention/backends/mla/__pycache__"
+if os.path.isdir(d):
+    for f in os.listdir(d):
+        if "sparse_swa" in f:
+            os.remove(os.path.join(d, f))
+print("[ds4] DS4_KV_PATCH_V2 applied; pycache wiped")
+PY_KV2
+fi
+
 # Sanity-check our quant config registered.
 python3 - <<'PY'
 from vllm.model_executor.layers.quantization import (
