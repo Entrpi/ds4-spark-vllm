@@ -22,6 +22,26 @@ DS4_LOCAL="${DS4_LOCAL:-/workspace/ds4-spark-vllm}"
 
 echo "=== ds4-2bit-deepseek-v4-flash :: lmxxf base ==="
 
+# Replace tilelang's incomplete libcudart_stub.so with the real CUDA runtime.
+# Tilelang ships a stub library with only ~55 symbols (no cudaDeviceReset).
+# flashinfer.comm.cuda_ipc.CudaRTLibrary() scans /proc/self/maps for any
+# library whose name contains "libcudart" and binds to the first match,
+# which becomes tilelang's stub once tilelang is imported. Without
+# cudaDeviceReset, flashinfer crashes at module load. Replacing the stub
+# file with a copy of the real libcudart.so.13 makes tilelang's dlopen
+# (by absolute path) still succeed and gives flashinfer the symbols it
+# needs.  Idempotent: only swaps if cudaDeviceReset is missing.
+TILELANG_STUB="$SITE_PACKAGES/tilelang/lib/libcudart_stub.so"
+REAL_CUDART="/usr/local/cuda/lib64/libcudart.so.13"
+if [ -f "$TILELANG_STUB" ] && [ -f "$REAL_CUDART" ]; then
+    if ! nm -D "$TILELANG_STUB" 2>/dev/null | grep -q cudaDeviceReset; then
+        echo "[ds4] Replacing tilelang's libcudart_stub.so with real libcudart (cudaDeviceReset fix)"
+        cp -f "$TILELANG_STUB" "$TILELANG_STUB.bak.$(date +%s)" 2>/dev/null || true
+        cp -f "$REAL_CUDART" "$TILELANG_STUB"
+        echo "[ds4] libcudart stub patched; cudaDeviceReset now present"
+    fi
+fi
+
 if [ ! -f "$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py" ]; then
     echo "[ds4 ERROR] lmxxf image missing deepseek_v4.py"
     exit 1

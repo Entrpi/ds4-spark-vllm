@@ -78,6 +78,10 @@ SKIP_SMOKE=0
 NO_START=0
 INSTALL_SYSTEMD=
 UNINSTALL=0
+# After /health goes green, upgrade docker --restart from `no` (bring-up) to
+# `unless-stopped` (production reboot-recovery). Set 0 to leave restart=no
+# (useful for systemd-managed setups, or while iterating on configs).
+AUTO_RESTART=1
 # Performance: enforce-eager disables torch.compile + CUDA graphs (a multi-x
 # decode penalty). The earlier failure on the lmxxf base image (engine worker
 # vanishing silently after compile, no traceback) was the cold mHC TileLang
@@ -111,6 +115,7 @@ Flags (all optional):
   --skip-smoke           Skip the first-token smoke test
   --enforce-eager        Force torch.compile + CUDA graphs off (default ON during bring-up)
   --no-enforce-eager     Try the perf-on path (currently fails silently — see notes)
+  --no-auto-restart      Leave docker --restart=no even after /health green (default: upgrade to unless-stopped)
   --no-start             Set up everything but do not start the container
   --systemd              Install systemd unit non-interactively
   --no-systemd           Skip the systemd prompt
@@ -145,6 +150,7 @@ while [[ $# -gt 0 ]]; do
     --skip-smoke)       SKIP_SMOKE=1; shift ;;
     --enforce-eager)    ENFORCE_EAGER=1; shift ;;
     --no-enforce-eager) ENFORCE_EAGER=0; shift ;;
+    --no-auto-restart)  AUTO_RESTART=0; shift ;;
     --no-start)         NO_START=1; shift ;;
     --systemd)          INSTALL_SYSTEMD=1; shift ;;
     --no-systemd)       INSTALL_SYSTEMD=0; shift ;;
@@ -574,11 +580,17 @@ EOSH
     say "mounting vllm-fork: $VLLM_FORK_DIR -> /workspace/vllm-fork"
   fi
 
+  # Two-phase restart policy:
+  #   1. Launch with --restart no — silent failures surface immediately,
+  #      no masked restart loops during startup.
+  #   2. Upgrade to --restart unless-stopped only AFTER /health is green,
+  #      so production reboot-recovery kicks in only when we've proven the
+  #      container actually works. See AUTO_RESTART below.
   docker run -d \
     --gpus all \
     --name "$CONTAINER_NAME" \
     --network host \
-    --restart unless-stopped \
+    --restart no \
     -v "$MODELS_DIR":/models \
     -v "$WORK_DIR":/work \
     -v "$LOGS_DIR":/logs \
@@ -624,6 +636,12 @@ if [[ "$NO_START" -eq 0 && "$SKIP_SMOKE" -eq 0 ]]; then
 
   if curl -fsS "$HEALTH_URL" >/dev/null 2>&1; then
     ok "vLLM is healthy"
+    # Upgrade restart policy now that we've proven the container reaches /health.
+    # Skip with --no-auto-restart (e.g. systemd-managed setups).
+    if [[ "${AUTO_RESTART:-1}" -eq 1 ]]; then
+      docker update --restart unless-stopped "$CONTAINER_NAME" >/dev/null 2>&1 && \
+        ok "restart policy upgraded to unless-stopped (production reboot-recovery)"
+    fi
     SMOKE_SH="$WORK_DIR/scripts/smoke-test.sh"
     if [[ -x "$SMOKE_SH" ]]; then
       say "running smoke test: $SMOKE_SH"
