@@ -49,8 +49,25 @@ VLLM_FORK_DIR="${VLLM_FORK_DIR:-/workspace/vllm-fork}"
 if [ -d "$VLLM_FORK_DIR/vllm" ] && [ "${DS4_VLLM_OVERLAY:-1}" = "1" ]; then
     echo "[ds4] Overlaying $VLLM_FORK_DIR/vllm/ -> $SITE_PACKAGES/vllm/ (python files only)"
     # Copy python files only; preserve *.so / *.json / non-py artifacts.
-    rsync -a --include='*/' --include='*.py' --exclude='*' \
-        "$VLLM_FORK_DIR/vllm/" "$SITE_PACKAGES/vllm/"
+    # NOTE: lmxxf base image doesn't ship rsync, so we do the walk in python.
+    python3 - <<PY_OVERLAY
+import os, shutil, sys
+src = "$VLLM_FORK_DIR/vllm"
+dst = "$SITE_PACKAGES/vllm"
+copied = 0
+skipped_dirs = {"__pycache__"}
+for root, dirs, files in os.walk(src):
+    dirs[:] = [d for d in dirs if d not in skipped_dirs]
+    rel = os.path.relpath(root, src)
+    dst_dir = dst if rel == "." else os.path.join(dst, rel)
+    os.makedirs(dst_dir, exist_ok=True)
+    for f in files:
+        if not f.endswith(".py"):
+            continue
+        shutil.copy2(os.path.join(root, f), os.path.join(dst_dir, f))
+        copied += 1
+print(f"[ds4] overlay: copied {copied} python files")
+PY_OVERLAY
     # Wipe pycache so the new source loads cleanly on import.
     find "$SITE_PACKAGES/vllm" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
     OVERLAY_SHA=$(git -C "$VLLM_FORK_DIR" rev-parse --short=10 HEAD 2>/dev/null || echo unknown)
