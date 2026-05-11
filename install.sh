@@ -522,7 +522,7 @@ else
   # Build env-var args. DG_LOCAL is intentionally only set if the dir exists,
   # so we don't break the in-container fallback to the image's built-in DeepGEMM.
   ENV_ARGS=(
-    -e "LD_PRELOAD=/usr/local/cuda/lib64/libnvrtc.so"
+    -e "LD_PRELOAD=/usr/local/cuda/lib64/libcudart.so.13:/usr/local/cuda/lib64/libnvrtc.so"
     -e "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0"
     -e "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1"
     -e "DS4_CKPT_DIR=/models/$MODEL_DIR_NAME"
@@ -673,7 +673,7 @@ ExecStart=/usr/bin/docker run --rm \\
   -v $LOGS_DIR:/logs \\
   -v $EXTRAS_DIR:/extras \\
   -v $VLLM_FORK_DIR:/workspace/vllm-fork \\
-  -e LD_PRELOAD=/usr/local/cuda/lib64/libnvrtc.so \\
+  -e LD_PRELOAD=/usr/local/cuda/lib64/libcudart.so.13:/usr/local/cuda/lib64/libnvrtc.so \\
   -e VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0 \\
   -e VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1 \\
   -e DS4_CKPT_DIR=/models/$MODEL_DIR_NAME \\
