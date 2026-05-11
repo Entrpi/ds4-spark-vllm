@@ -96,7 +96,7 @@ Observed on Spark with the patches below applied (`gpu_memory_utilization=0.86`,
 | Maximum concurrency @ 16K tokens/req | **229.56×** |
 | Single-stream decode (eager) | ~1.75 t/s |
 
-The 229× concurrency is post-fix. Out of the box on the lmxxf base image, vLLM was admitting the V4-Flash compressor-state cache and the SWA cache as if they were full-attention pools rather than fixed-size state-space modules (paper §3.5.1), giving ~25× concurrency at the same context — a ~9× difference. Three patches in the [`Entrpi/vllm`](https://github.com/Entrpi/vllm/tree/main) fork close this:
+The 229× concurrency is post-fix. Out of the box on the lmxxf base image, vLLM was admitting the V4-Flash compressor-state cache and the SWA cache as if they were full-attention pools rather than fixed-size state-space modules (paper §3.5.1), giving ~25× concurrency at the same context — a ~9× difference. Three patches in the [`Entrpi/vllm`](https://github.com/Entrpi/vllm/tree/kv-layout-dsv4-compressor-state) fork (branch `kv-layout-dsv4-compressor-state`) close this:
 
 - **V1 `CompressorStateMLASpec`** ([`f19b8bd6d`](https://github.com/Entrpi/vllm/commit/f19b8bd6d)) — bounds the compressor-state cache by `sliding_window` only (the cache is a fixed-size SSM; the parent `SlidingWindowMLASpec`'s default also includes `max_num_batched_tokens`, which over-allocates by ~300×).
 - **V2 SWA cache routing** ([`a76f88dfe`](https://github.com/Entrpi/vllm/commit/a76f88dfe)) — same fix routed through `DeepseekV4SWACache.get_kv_cache_spec`.
