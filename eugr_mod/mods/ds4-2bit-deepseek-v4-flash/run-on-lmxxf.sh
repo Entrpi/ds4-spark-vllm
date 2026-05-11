@@ -38,6 +38,29 @@ fi
 echo "[ds4] pip install -e $DS4_LOCAL"
 pip install -e "$DS4_LOCAL"
 
+# Optional: overlay our vllm fork's python tree over the installed vllm.
+# When DS4_VLLM_OVERLAY=1 (default if /workspace/vllm-fork exists), replaces
+# site-packages/vllm/**/*.py with our fork's source. This lets us run
+# Entrpi/vllm@kv-layout-on-jasl-c2d4811 (jasl's current PR #41834 head + our
+# V1/V2/V3 KV cache fixes) against the lmxxf image's compiled extensions
+# (vllm/_C.so etc.) without a full image rebuild. Pure-python + Triton
+# changes only — no C++ ABI surface modified by either party.
+VLLM_FORK_DIR="${VLLM_FORK_DIR:-/workspace/vllm-fork}"
+if [ -d "$VLLM_FORK_DIR/vllm" ] && [ "${DS4_VLLM_OVERLAY:-1}" = "1" ]; then
+    echo "[ds4] Overlaying $VLLM_FORK_DIR/vllm/ -> $SITE_PACKAGES/vllm/ (python files only)"
+    # Copy python files only; preserve *.so / *.json / non-py artifacts.
+    rsync -a --include='*/' --include='*.py' --exclude='*' \
+        "$VLLM_FORK_DIR/vllm/" "$SITE_PACKAGES/vllm/"
+    # Wipe pycache so the new source loads cleanly on import.
+    find "$SITE_PACKAGES/vllm" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
+    OVERLAY_SHA=$(git -C "$VLLM_FORK_DIR" rev-parse --short=10 HEAD 2>/dev/null || echo unknown)
+    echo "[ds4] vllm fork overlay applied at $OVERLAY_SHA"
+    DS4_VLLM_OVERLAY=1
+else
+    echo "[ds4] vllm fork overlay skipped (DS4_VLLM_OVERLAY=${DS4_VLLM_OVERLAY:-1}, dir=$VLLM_FORK_DIR exists=$([ -d $VLLM_FORK_DIR/vllm ] && echo yes || echo no))"
+    DS4_VLLM_OVERLAY=0
+fi
+
 # Patch deepseek_v4.py load_weights to gracefully handle expert tensor names
 # that don't match the standard w1/w2/w3 mapping (we use w13_iq2xxs_qs etc).
 # This is OUR patch — not in lmxxf's image.
@@ -220,7 +243,9 @@ fi
 # of the state cache as a state-space model.
 KV_INTERFACE_PY="$SITE_PACKAGES/vllm/v1/kv_cache_interface.py"
 DEEPSEEK_COMPRESSOR_PY="$SITE_PACKAGES/vllm/model_executor/layers/deepseek_compressor.py"
-if ! grep -q "DS4_KV_PATCH_V1" "$KV_INTERFACE_PY"; then
+if [ "$DS4_VLLM_OVERLAY" = "1" ]; then
+    echo "[ds4] V1 monkey-patch skipped — overlay supplies CompressorStateMLASpec natively"
+elif ! grep -q "DS4_KV_PATCH_V1" "$KV_INTERFACE_PY"; then
     echo "[ds4] Patching KV cache compressor-state spec (~300x over-allocation fix)"
     python3 - <<PY_KV
 import os
@@ -314,7 +339,9 @@ fi
 # this contributes ~395 MiB per request — the dominant remaining KV
 # over-allocation contributor after V1 (paper §3.5.1).
 SPARSE_SWA_PY="$SITE_PACKAGES/vllm/v1/attention/backends/mla/sparse_swa.py"
-if ! grep -q "DS4_KV_PATCH_V2" "$SPARSE_SWA_PY"; then
+if [ "$DS4_VLLM_OVERLAY" = "1" ]; then
+    echo "[ds4] V2 monkey-patch skipped — overlay supplies DeepseekV4SWACache fix natively"
+elif ! grep -q "DS4_KV_PATCH_V2" "$SPARSE_SWA_PY"; then
     echo "[ds4] Patching DeepseekV4SWACache spec (~85x SWA over-allocation fix)"
     python3 - <<PY_KV2
 sw_p = "$SPARSE_SWA_PY"
@@ -385,7 +412,9 @@ fi
 # served — the reported concurrency improvements were mid-startup ghost
 # numbers.
 SINGLE_TYPE_MGR_PY="$SITE_PACKAGES/vllm/v1/core/single_type_kv_cache_manager.py"
-if ! grep -q "DS4_KV_PATCH_V3" "$SINGLE_TYPE_MGR_PY"; then
+if [ "$DS4_VLLM_OVERLAY" = "1" ]; then
+    echo "[ds4] V3 monkey-patch skipped — overlay supplies spec_manager_map entry natively"
+elif ! grep -q "DS4_KV_PATCH_V3" "$SINGLE_TYPE_MGR_PY"; then
     echo "[ds4] Patching spec_manager_map to register CompressorStateMLASpec"
     python3 - <<PY_KV3
 mgr_p = "$SINGLE_TYPE_MGR_PY"

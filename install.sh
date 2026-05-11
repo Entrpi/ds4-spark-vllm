@@ -52,6 +52,11 @@ LOGS_DIR="${LOGS_DIR:-$HOME/logs}"
 EXTRAS_DIR="${EXTRAS_DIR:-$HOME/extras}"
 OVERLAY_REPO="${OVERLAY_REPO:-https://github.com/Entrpi/ds4-spark-vllm.git}"
 OVERLAY_REF="${OVERLAY_REF:-main}"
+# Optional: path on host to a vllm-fork checkout. If present, run-on-lmxxf.sh
+# overlays its python tree on top of the base image's site-packages/vllm/.
+# This lets us validate jasl's PR #41834 head + our V1/V2/V3 KV patches
+# without a full Docker image rebuild. Set to empty to disable.
+VLLM_FORK_DIR="${VLLM_FORK_DIR:-$HOME/vllm-fork}"
 BASE_IMAGE="${BASE_IMAGE:-lmxxf/vllm-deepseek-v4-dgx-spark:latest}"
 CONTAINER_NAME="${CONTAINER_NAME:-vllm-ds4}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-dsv4}"
@@ -74,17 +79,14 @@ NO_START=0
 INSTALL_SYSTEMD=
 UNINSTALL=0
 # Performance: enforce-eager disables torch.compile + CUDA graphs (a multi-x
-# decode penalty). The lmxxf sparse-MLA path advertises cudagraph-safety
-# (`triton_sparse_mla_cudagraphs_allowed` returns True when no spec-dec is
-# configured), but in practice CUDA graph capture failed silently mid-init
-# on Spark — engine worker vanishes with no traceback before the first KV
-# cache allocation. Until that's bisected, default ENFORCE_EAGER=1 to ship
-# a working server at the (slow) bring-up perf level. The flag and the
-# VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1 env var stay wired so the
-# perf-on path can be re-attempted with --no-enforce-eager once we find
-# the missing piece (mhc_pre / fp8_utils kernel-config cache miss are the
-# leading suspects).
-ENFORCE_EAGER=1
+# decode penalty). The earlier failure on the lmxxf base image (engine worker
+# vanishing silently after compile, no traceback) was the cold mHC TileLang
+# kernel JITing inside the cudagraph capture context — jasl's PR #41834
+# commit #9 ("Warm DeepSeek V4 startup kernels") adds engine-init warmup that
+# runs these kernels OUT of the capture path, eliminating the failure. With
+# the vllm-fork overlay active (VLLM_FORK_DIR set), default ENFORCE_EAGER=0
+# so we get torch.compile + cudagraphs and the ~10x decode TPOT win.
+ENFORCE_EAGER=0
 
 usage() {
   sed -n 's/^# \{0,1\}//p' "$0" | sed -n '/^install\.sh /,/^License:/p'
@@ -557,9 +559,20 @@ exec vllm serve /models/$MODEL_DIR_NAME \\
   --max-model-len $MAX_MODEL_LEN \\
   --gpu-memory-utilization $GPU_UTIL \\
   --kv-cache-dtype $KV_DTYPE \\
-  --attention-backend $ATTN_BACKEND${ENFORCE_EAGER_ARG} 2>&1 | tee /logs/serve.log
+  --attention-backend $ATTN_BACKEND \\
+  --block-size 256 \\
+  --no-enable-flashinfer-autotune \\
+  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'${ENFORCE_EAGER_ARG} 2>&1 | tee /logs/serve.log
 EOSH
   chmod +x "$RUN_INNER"
+
+  # Optional vllm-fork mount (python-tree overlay). Lets us run jasl's PR
+  # head + our V1/V2/V3 against the lmxxf image's compiled extensions.
+  FORK_MOUNT=()
+  if [[ -d "$VLLM_FORK_DIR" ]]; then
+    FORK_MOUNT=( -v "$VLLM_FORK_DIR":/workspace/vllm-fork )
+    say "mounting vllm-fork: $VLLM_FORK_DIR -> /workspace/vllm-fork"
+  fi
 
   docker run -d \
     --gpus all \
@@ -570,6 +583,7 @@ EOSH
     -v "$WORK_DIR":/work \
     -v "$LOGS_DIR":/logs \
     -v "$EXTRAS_DIR":/extras \
+    "${FORK_MOUNT[@]}" \
     "${ENV_ARGS[@]}" \
     --entrypoint bash \
     "$BASE_IMAGE" \
@@ -658,6 +672,7 @@ ExecStart=/usr/bin/docker run --rm \\
   -v $WORK_DIR:/work \\
   -v $LOGS_DIR:/logs \\
   -v $EXTRAS_DIR:/extras \\
+  -v $VLLM_FORK_DIR:/workspace/vllm-fork \\
   -e LD_PRELOAD=/usr/local/cuda/lib64/libnvrtc.so \\
   -e VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0 \\
   -e VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1 \\
