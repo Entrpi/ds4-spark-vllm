@@ -85,6 +85,31 @@ These are the load-bearing pieces of the install. Both are baked into the instal
 
 The full bring-up story — how those two bugs were located via layer-by-layer hidden-state bisection against the `antirez/ds4` reference, and what didn't work — is in [`docs/DSV4_FLASH_2BIT_SPARK_REPORT.md`](docs/DSV4_FLASH_2BIT_SPARK_REPORT.md).
 
+## KV cache + performance
+
+Observed on Spark with the patches below applied (`gpu_memory_utilization=0.86`, `max_model_len=16384`):
+
+| Metric | Value |
+|---|---|
+| Available KV cache memory | 19.11 GiB |
+| GPU KV cache size | 15,608 tokens |
+| Maximum concurrency @ 16K tokens/req | **229.56×** |
+| Single-stream decode (eager) | ~1.75 t/s |
+
+The 229× concurrency is post-fix. Out of the box on the lmxxf base image, vLLM was admitting the V4-Flash compressor-state cache and the SWA cache as if they were full-attention pools rather than fixed-size state-space modules (paper §3.5.1), giving ~25× concurrency at the same context — a ~9× difference. Three patches in the [`Entrpi/vllm`](https://github.com/Entrpi/vllm/tree/main) fork close this:
+
+- **V1 `CompressorStateMLASpec`** ([`f19b8bd6d`](https://github.com/Entrpi/vllm/commit/f19b8bd6d)) — bounds the compressor-state cache by `sliding_window` only (the cache is a fixed-size SSM; the parent `SlidingWindowMLASpec`'s default also includes `max_num_batched_tokens`, which over-allocates by ~300×).
+- **V2 SWA cache routing** ([`a76f88dfe`](https://github.com/Entrpi/vllm/commit/a76f88dfe)) — same fix routed through `DeepseekV4SWACache.get_kv_cache_spec`.
+- **V3 `spec_manager_map` registration** ([`1fb6b7614`](https://github.com/Entrpi/vllm/commit/1fb6b7614)) — the dispatch dict uses exact-type lookup, so the subclass needs an explicit entry. Without it, EngineCore was crashing silently with `KeyError` on startup, masked by a 22-min `wait_for_engine_startup` grace period.
+
+The patches are mirrored as monkey-patches against the base image in [`eugr_mod/mods/ds4-2bit-deepseek-v4-flash/run-on-lmxxf.sh`](eugr_mod/mods/ds4-2bit-deepseek-v4-flash/run-on-lmxxf.sh) under `DS4_KV_PATCH_V1` / `V2` / `V3` markers. This is a stopgap; the clean path is a Docker image built from the fork (Option A — tracked).
+
+### Known perf limits / roadmap
+
+- **Decode throughput is currently at the bring-up floor (~1.75 t/s).** `--enforce-eager` is on by default, which disables `torch.compile` and CUDA graphs. Attempting `--no-enforce-eager` currently fails silently mid-init (engine worker vanishes after compile, no traceback). Bisecting that is the highest-leverage next item — leading suspects are the `mhc_pre` Tilelang kernel cudagraph-capture path and FP8 W8A8 kernel-config cache misses.
+- **Long-context (≥128K)** is architecturally supported (paper §2.3.4 puts V4-Flash KV at ~7% of V3.2 at 1M context, and the V1/V2 patches make vLLM's admission math match that). At 256K and the same 0.86 gpu-util, the math says ~73 concurrent slots fit in the 19 GiB pool — but this is gated on perf-on, because at 1.75 t/s a 256K reply takes ~1.7 days.
+- **MTP draft head** is present in the checkpoint but its param names are unmapped (265 unloaded tensors). Enabling speculative decoding requires a naming-convention remap rule alongside the existing FFN weight maps.
+
 ## Repo layout
 
 ```
