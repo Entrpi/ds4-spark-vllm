@@ -223,28 +223,40 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
 
         out = torch.zeros((T, hidden), dtype=x.dtype, device=device)
 
+        # Diagnostic paths below are skipped during torch.compile tracing
+        # and during cudagraph stream capture. The capture-guard pattern
+        # mirrors fused_batched_moe.py:619-627 in vllm. Reason: file
+        # checks, .item() calls, and .cpu() transfers are forbidden inside
+        # cudagraph capture; skipping them defensively makes apply()
+        # capture-safe even if it ends up inside a captured region.
+        _diag_safe = not (
+            torch.compiler.is_compiling()
+            or torch.cuda.is_current_stream_capturing()
+        )
+
         # DS4_TRACE: file-toggled diagnostic modes.
         # /logs/ds4_moe_noop exists → return zeros (no contribution)
         # /logs/ds4_moe_passthrough exists → return x (input passes through)
         # Comparing all three modes (normal / noop / passthrough) isolates
         # whether the 2-bit math itself is the problem.
-        import os as _os
-        if _os.path.exists("/logs/ds4_moe_noop"):
-            if T <= 16:
-                print(
-                    f"[DS4_TRACE] apply() NOOP MODE: returning zeros for "
-                    f"T={T} hidden={hidden}",
-                    flush=True,
-                )
-            return out
-        if _os.path.exists("/logs/ds4_moe_passthrough"):
-            if T <= 16:
-                print(
-                    f"[DS4_TRACE] apply() PASSTHROUGH MODE: returning x for "
-                    f"T={T} hidden={hidden}",
-                    flush=True,
-                )
-            return x.clone()
+        if _diag_safe:
+            import os as _os
+            if _os.path.exists("/logs/ds4_moe_noop"):
+                if T <= 16:
+                    print(
+                        f"[DS4_TRACE] apply() NOOP MODE: returning zeros for "
+                        f"T={T} hidden={hidden}",
+                        flush=True,
+                    )
+                return out
+            if _os.path.exists("/logs/ds4_moe_passthrough"):
+                if T <= 16:
+                    print(
+                        f"[DS4_TRACE] apply() PASSTHROUGH MODE: returning x for "
+                        f"T={T} hidden={hidden}",
+                        flush=True,
+                    )
+                return x.clone()
 
         # _apply_call_count fuels the env-gated DS4_ROUTE / DS4_HDUMP paths
         # below; it's incremented unconditionally so call IDs stay monotonic.
@@ -258,7 +270,7 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         # entropy across the 43-layer stack.
         try:
             import os as _os
-            _arm = _os.path.exists("/logs/ds4_route_arm")
+            _arm = _diag_safe and _os.path.exists("/logs/ds4_route_arm")
         except Exception:
             _arm = False
         if T <= 16 and _arm:
@@ -355,7 +367,7 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         # overwrite prefill dumps as generation proceeds.
         try:
             import os as _os2
-            if T >= 1 and _os2.path.exists("/logs/ds4_dump_arm"):
+            if _diag_safe and T >= 1 and _os2.path.exists("/logs/ds4_dump_arm"):
                 # Resolve layer index (seq registry is the only thing
                 # that actually works in our build).
                 _seq = getattr(layer, "_ds4_seq", None)

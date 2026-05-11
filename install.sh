@@ -546,6 +546,17 @@ else
   # `--enforce-eager` is opt-in (debug-only). Default OFF so torch.compile +
   # CUDA graphs run, which is the difference between ~1.7 t/s and decode
   # throughput in the expected single-stream range on Spark.
+  #
+  # `cudagraph_mode=PIECEWISE` (not FULL_AND_PIECEWISE): our 2-bit MoE
+  # apply() does a per-(token, expert) Python loop with an int(.item())
+  # inside, which is not capture-safe. By listing `vllm::moe_forward` and
+  # `vllm::moe_forward_shared` in `splitting_ops` we make them FX-level
+  # boundaries — their bodies (our apply()) run eagerly between captured
+  # pieces. FULL mode would still try to capture the whole forward and
+  # crash. The attention/SSM/KV ops in `splitting_ops` mirror vLLM's
+  # default `_attention_ops` list; once you pass `splitting_ops`
+  # explicitly, the default is replaced wholesale, so all attention ops
+  # must be restated.
   if [[ "$ENFORCE_EAGER" -eq 1 ]]; then
     ENFORCE_EAGER_ARG=" --enforce-eager"
   else
@@ -568,7 +579,7 @@ exec vllm serve /models/$MODEL_DIR_NAME \\
   --attention-backend $ATTN_BACKEND \\
   --block-size 256 \\
   --no-enable-flashinfer-autotune \\
-  --compilation-config '{"cudagraph_mode":"FULL_AND_PIECEWISE","custom_ops":["all"]}'${ENFORCE_EAGER_ARG} 2>&1 | tee /logs/serve.log
+  --compilation-config '{"cudagraph_mode":"PIECEWISE","custom_ops":["all"],"splitting_ops":["vllm::unified_attention_with_output","vllm::unified_mla_attention_with_output","vllm::mamba_mixer2","vllm::mamba_mixer","vllm::short_conv","vllm::linear_attention","vllm::plamo2_mamba_mixer","vllm::gdn_attention_core","vllm::gdn_attention_core_xpu","vllm::olmo_hybrid_gdn_full_forward","vllm::kda_attention","vllm::sparse_attn_indexer","vllm::rocm_aiter_sparse_attn_indexer","vllm::deepseek_v4_attention","vllm::deepseek_v4_fp8_einsum","vllm::unified_kv_cache_update","vllm::unified_mla_kv_cache_update","vllm::moe_forward","vllm::moe_forward_shared"]}'${ENFORCE_EAGER_ARG} 2>&1 | tee /logs/serve.log
 EOSH
   chmod +x "$RUN_INNER"
 
