@@ -20,7 +20,9 @@
 #   8. Starts the vLLM serve container with all correctness-critical flags:
 #        - --quantization deepseek_v4_hybrid_iq2  (registered by overlay plugin)
 #        - VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE=0 (SM121 decode-kernel workaround)
-#        - --kv-cache-dtype fp8, --attention-backend FLASHINFER (CUDA graphs ON by default)
+#        - --kv-cache-dtype fp8, --attention-backend FLASHINFER, --enforce-eager
+#          (CUDA graph perf-on path tracked separately; capture fails silently
+#          on the current image, see install.sh ENFORCE_EAGER notes)
 #   9. Polls /health, then runs a single-token smoke test against the
 #      reference prompt ("The capital of France is" → expect text starting
 #      with " We"). Prints PASS or FAIL with the actual response.
@@ -72,10 +74,17 @@ NO_START=0
 INSTALL_SYSTEMD=
 UNINSTALL=0
 # Performance: enforce-eager disables torch.compile + CUDA graphs (a multi-x
-# decode penalty). lmxxf's sparse MLA path is cudagraph-safe per its own gating
+# decode penalty). The lmxxf sparse-MLA path advertises cudagraph-safety
 # (`triton_sparse_mla_cudagraphs_allowed` returns True when no spec-dec is
-# configured). Default OFF; flip on with --enforce-eager only for debugging.
-ENFORCE_EAGER=0
+# configured), but in practice CUDA graph capture failed silently mid-init
+# on Spark — engine worker vanishes with no traceback before the first KV
+# cache allocation. Until that's bisected, default ENFORCE_EAGER=1 to ship
+# a working server at the (slow) bring-up perf level. The flag and the
+# VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH=1 env var stay wired so the
+# perf-on path can be re-attempted with --no-enforce-eager once we find
+# the missing piece (mhc_pre / fp8_utils kernel-config cache miss are the
+# leading suspects).
+ENFORCE_EAGER=1
 
 usage() {
   sed -n 's/^# \{0,1\}//p' "$0" | sed -n '/^install\.sh /,/^License:/p'
@@ -98,7 +107,8 @@ Flags (all optional):
   --skip-download        Skip model download (assume already present)
   --skip-verify          Skip SHA256SUMS check
   --skip-smoke           Skip the first-token smoke test
-  --enforce-eager        Disable torch.compile + CUDA graphs (debugging; ~5-10x slower)
+  --enforce-eager        Force torch.compile + CUDA graphs off (default ON during bring-up)
+  --no-enforce-eager     Try the perf-on path (currently fails silently — see notes)
   --no-start             Set up everything but do not start the container
   --systemd              Install systemd unit non-interactively
   --no-systemd           Skip the systemd prompt
@@ -132,6 +142,7 @@ while [[ $# -gt 0 ]]; do
     --skip-verify)      SKIP_VERIFY=1; shift ;;
     --skip-smoke)       SKIP_SMOKE=1; shift ;;
     --enforce-eager)    ENFORCE_EAGER=1; shift ;;
+    --no-enforce-eager) ENFORCE_EAGER=0; shift ;;
     --no-start)         NO_START=1; shift ;;
     --systemd)          INSTALL_SYSTEMD=1; shift ;;
     --no-systemd)       INSTALL_SYSTEMD=0; shift ;;
