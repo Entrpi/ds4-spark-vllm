@@ -67,14 +67,21 @@ pip install -e "$DS4_LOCAL"
 # changes only — no C++ ABI surface modified by either party.
 VLLM_FORK_DIR="${VLLM_FORK_DIR:-/workspace/vllm-fork}"
 if [ -d "$VLLM_FORK_DIR/vllm" ] && [ "${DS4_VLLM_OVERLAY:-1}" = "1" ]; then
-    echo "[ds4] Overlaying $VLLM_FORK_DIR/vllm/ -> $SITE_PACKAGES/vllm/ (python files only)"
-    # Copy python files only; preserve *.so / *.json / non-py artifacts.
+    echo "[ds4] Overlaying $VLLM_FORK_DIR/vllm/ -> $SITE_PACKAGES/vllm/ (.py + data files)"
+    # Copy python sources and pure-data files (kernel-tuning JSONs, YAMLs).
+    # NEVER copy *.so — those are compiled C++ extensions built against the
+    # base image's torch/cuda; ABI mismatch would crash the worker.
+    # The .json copy is critical: jasl's PR #41834 commit #2 adds GB10-specific
+    # FP8 W8A8 block-tuning configs under configs/. Without them, FP8 dense
+    # linears fall back to the "default" kernel and emit
+    # "Performance might be sub-optimal" warnings.
     # NOTE: lmxxf base image doesn't ship rsync, so we do the walk in python.
     python3 - <<PY_OVERLAY
 import os, shutil, sys
 src = "$VLLM_FORK_DIR/vllm"
 dst = "$SITE_PACKAGES/vllm"
-copied = 0
+overlay_exts = (".py", ".json", ".yaml", ".yml", ".jinja", ".cubin", ".ptx")
+counts = {ext: 0 for ext in overlay_exts}
 skipped_dirs = {"__pycache__"}
 for root, dirs, files in os.walk(src):
     dirs[:] = [d for d in dirs if d not in skipped_dirs]
@@ -82,11 +89,12 @@ for root, dirs, files in os.walk(src):
     dst_dir = dst if rel == "." else os.path.join(dst, rel)
     os.makedirs(dst_dir, exist_ok=True)
     for f in files:
-        if not f.endswith(".py"):
+        ext = os.path.splitext(f)[1].lower()
+        if ext not in overlay_exts:
             continue
         shutil.copy2(os.path.join(root, f), os.path.join(dst_dir, f))
-        copied += 1
-print(f"[ds4] overlay: copied {copied} python files")
+        counts[ext] += 1
+print("[ds4] overlay: copied " + ", ".join(f"{n} {ext}" for ext, n in counts.items() if n))
 PY_OVERLAY
     # Wipe pycache so the new source loads cleanly on import.
     find "$SITE_PACKAGES/vllm" -name "__pycache__" -type d -exec rm -rf {} + 2>/dev/null || true
