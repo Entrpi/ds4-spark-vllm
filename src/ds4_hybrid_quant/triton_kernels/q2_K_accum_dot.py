@@ -169,33 +169,36 @@ if HAVE_TRITON:
             ).to(tl.int32)
             summs = tl.sum(bsums * scale_hi, axis=0)
 
-            # Per-block isum: 2 outer * 4 shifts * 2 halves = 16 dot pieces.
-            # Each piece is a 16-element int dot. We load each scale_lo
-            # nibble directly from memory via offset (Triton tensors
-            # don't support Python-int subscripting inside @jit).
+            # Per-block isum: vectorized across all 4 shifts at once.
+            # Each k-half: load 32 q2 bytes once, unpack 4 shifts in
+            # parallel into a (4, 32) tile, multiply with the matching
+            # (4, 32) q8 tile, then split into lo (positions 0..16) and
+            # hi (positions 16..32) sums per shift, weighted by scales.
             isum = tl.zeros((), dtype=tl.int32)
-            is_idx = 0
-            j16 = tl.arange(0, 16)
+            shifts4 = (tl.arange(0, 4) * 2).to(tl.int32)        # (4,)
+            pos32 = tl.arange(0, 32)
+            mask_lo = pos32 < 16                                  # (32,)
             for k in tl.static_range(0, 2):  # QK_K/128
                 base_q2 = blk * 64 + k * 32
                 base_q8 = blk * BLOCK + k * 128
-                for j in tl.static_range(0, 4):  # shift index
-                    shift = 2 * j
-                    # lo16
-                    sc_lo = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
-                    q2_lo = ((tl.load(w_qs_row + base_q2 + j16) >> shift) & 0x03).to(tl.int32)
-                    q8_lo = tl.load(q8_qs_tok + base_q8 + j * 32 + j16).to(tl.int32)
-                    s_lo = tl.sum(q2_lo * q8_lo, axis=0)
-                    isum = isum + sc_lo * s_lo
-                    is_idx += 1
-
-                    # hi16
-                    sc_hi = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
-                    q2_hi = ((tl.load(w_qs_row + base_q2 + 16 + j16) >> shift) & 0x03).to(tl.int32)
-                    q8_hi = tl.load(q8_qs_tok + base_q8 + j * 32 + 16 + j16).to(tl.int32)
-                    s_hi = tl.sum(q2_hi * q8_hi, axis=0)
-                    isum = isum + sc_hi * s_hi
-                    is_idx += 1
+                # Load 32 q2 bytes once.
+                qs32 = tl.load(w_qs_row + base_q2 + pos32).to(tl.int32)  # (32,)
+                # Unpack 4 shifts in parallel: (4, 32).
+                q2 = (qs32[None, :] >> shifts4[:, None]) & 0x03         # (4, 32) int32
+                # q8 chunks: 4 contiguous 32-element strips.
+                q8_offs = (tl.arange(0, 4) * 32)[:, None] + pos32[None, :]  # (4, 32)
+                q8 = tl.load(q8_qs_tok + base_q8 + q8_offs).to(tl.int32)    # (4, 32)
+                # Element-wise product.
+                prod = q2 * q8                                              # (4, 32)
+                # Split lo/hi via mask, sum per j.
+                s_lo_per_j = tl.sum(tl.where(mask_lo[None, :], prod, 0), axis=1)  # (4,)
+                s_hi_per_j = tl.sum(tl.where(~mask_lo[None, :], prod, 0), axis=1)
+                # Scales: per-j lo at is_idx (k*8 + 2j), hi at (k*8 + 2j + 1).
+                is_lo = k * 8 + tl.arange(0, 4) * 2          # (4,)
+                is_hi = k * 8 + tl.arange(0, 4) * 2 + 1
+                scales_lo = (tl.load(w_scales_row + blk * 16 + is_lo) & 0x0F).to(tl.int32)
+                scales_hi = (tl.load(w_scales_row + blk * 16 + is_hi) & 0x0F).to(tl.int32)
+                isum = isum + tl.sum(scales_lo * s_lo_per_j) + tl.sum(scales_hi * s_hi_per_j)
 
             d_blk = tl.load(w_d_row + blk).to(tl.float32)
             dmin_blk = tl.load(w_dmin_row + blk).to(tl.float32)

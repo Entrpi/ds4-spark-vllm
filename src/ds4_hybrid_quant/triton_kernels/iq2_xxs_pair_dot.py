@@ -157,6 +157,15 @@ if HAVE_TRITON:
         N_SUB: tl.constexpr,         # = 8
         SUB_SIZE: tl.constexpr,      # = 32
     ):
+        """Per-(token, row) IQ2_XXS pair dot — vectorized inner loop.
+
+        Grid = (M, n_rows). Each program computes one (m, row) pair's
+        gate+up dots. Inner sub-block is fully vectorized across 32 lanes:
+        one ``tl.load`` of the 8 qs bytes, parallel decode of 4 (grid,
+        sign) pairs, one ``tl.load`` of (4,8) signed_grid values, then a
+        single 32-element dot vs the q8 chunk. Replaces the previous
+        ``4 quads × 8 j`` scalar nest that left 24/32 lanes idle.
+        """
         """One program computes the two outputs for one (token, row).
 
         Grid is ``(M, n_rows)``. All M programs sharing a row_id read
@@ -176,98 +185,74 @@ if HAVE_TRITON:
         q8_qs_tok = q8_qs_ptr + m_id * stride_q8_qs_m
         q8_d_tok = q8_d_ptr + m_id * stride_q8_d_m
 
-        sum_a = 0.0
-        sum_b = 0.0
+        sum_a = tl.zeros((), dtype=tl.float32)
+        sum_b = tl.zeros((), dtype=tl.float32)
 
-        # All-block iteration. (For a vectorized version we'd tile over
-        # blocks; this scalar-block formulation is intentionally simple
-        # for the first cut.)
+        # Per-block iteration. Inner sub-block loop is vectorized across
+        # 32 lanes (the full sub-block size).
+        # Indices reused across sub-blocks.
+        quad = tl.arange(0, 4)              # (4,) for the 4 quads per sub-block
+        j4 = tl.arange(0, 4)                # (4,) for byte-pack reductions
+        j = tl.arange(0, 8)                 # (8,) for the 8 quants per quad
+        shifts4 = (j4 * 8).to(tl.uint32)    # (4,) shifts for u32 packing
+        # quants_in_sub flattens (quad, j) → (32,) so we can do one
+        # 32-element dot per sub-block instead of 4×8 scalar dots.
+        quants_in_sub = quad[:, None] * 8 + j[None, :]   # (4, 8) → 32 lanes when flat
         for blk in range(0, n_blocks):
-            # --- Load aux32 pairs for both rows (8 sub-blocks * 2 uint32s) ---
-            # qs is uint8[64]; reinterpret as uint32[16] for bit extraction.
-            qs_offs = tl.arange(0, 16)
-            a_aux = tl.load(
-                w_a_qs_row + blk * 64 + qs_offs * 4,
-                # cast 4 bytes -> uint32 by view (Triton has no direct view
-                # primitive on uint8 -> uint32, so we manually pack):
-            ).to(tl.uint32)
-            b_aux = tl.load(
-                w_b_qs_row + blk * 64 + qs_offs * 4,
-            ).to(tl.uint32)
+            d_q8 = tl.load(q8_d_tok + blk).to(tl.float32)
+            d_a = tl.load(w_a_d_row + blk).to(tl.float32)
+            d_b = tl.load(w_b_d_row + blk).to(tl.float32)
 
-            # NOTE: tl.load above reads uint8 values, not uint32. We need
-            # to read uint32 directly. To do that, reinterpret the qs
-            # buffer with stride-4 byte offsets and read 4 bytes at a
-            # time, packing manually:
-            #   aux32[k] = qs[4k] | qs[4k+1]<<8 | qs[4k+2]<<16 | qs[4k+3]<<24
-            # We do this below in a tighter form.
-
-            # Per sub-block (8 of them): aux32_0, aux32_1
             for sub in tl.static_range(0, N_SUB):
                 base = blk * 64 + sub * 8
-                # Pack four uint8 -> uint32 (little-endian) for both halves.
-                a_b0 = tl.load(w_a_qs_row + base + 0).to(tl.uint32)
-                a_b1 = tl.load(w_a_qs_row + base + 1).to(tl.uint32)
-                a_b2 = tl.load(w_a_qs_row + base + 2).to(tl.uint32)
-                a_b3 = tl.load(w_a_qs_row + base + 3).to(tl.uint32)
-                a_b4 = tl.load(w_a_qs_row + base + 4).to(tl.uint32)
-                a_b5 = tl.load(w_a_qs_row + base + 5).to(tl.uint32)
-                a_b6 = tl.load(w_a_qs_row + base + 6).to(tl.uint32)
-                a_b7 = tl.load(w_a_qs_row + base + 7).to(tl.uint32)
-                a_aux0 = a_b0 | (a_b1 << 8) | (a_b2 << 16) | (a_b3 << 24)
-                a_aux1 = a_b4 | (a_b5 << 8) | (a_b6 << 16) | (a_b7 << 24)
-
-                b_b0 = tl.load(w_b_qs_row + base + 0).to(tl.uint32)
-                b_b1 = tl.load(w_b_qs_row + base + 1).to(tl.uint32)
-                b_b2 = tl.load(w_b_qs_row + base + 2).to(tl.uint32)
-                b_b3 = tl.load(w_b_qs_row + base + 3).to(tl.uint32)
-                b_b4 = tl.load(w_b_qs_row + base + 4).to(tl.uint32)
-                b_b5 = tl.load(w_b_qs_row + base + 5).to(tl.uint32)
-                b_b6 = tl.load(w_b_qs_row + base + 6).to(tl.uint32)
-                b_b7 = tl.load(w_b_qs_row + base + 7).to(tl.uint32)
-                b_aux0 = b_b0 | (b_b1 << 8) | (b_b2 << 16) | (b_b3 << 24)
-                b_aux1 = b_b4 | (b_b5 << 8) | (b_b6 << 16) | (b_b7 << 24)
+                # Pack 8 uint8 qs bytes into two uint32s via shift+sum.
+                # Triton can't index a tensor with a scalar (a_bytes[0]
+                # is unsupported), so we use parallel masked reductions.
+                a_lo = tl.load(w_a_qs_row + base + j4).to(tl.uint32)      # (4,)
+                a_hi = tl.load(w_a_qs_row + base + 4 + j4).to(tl.uint32)  # (4,)
+                a_aux0 = tl.sum(a_lo << shifts4)                          # scalar u32
+                a_aux1 = tl.sum(a_hi << shifts4)
+                b_lo = tl.load(w_b_qs_row + base + j4).to(tl.uint32)
+                b_hi = tl.load(w_b_qs_row + base + 4 + j4).to(tl.uint32)
+                b_aux0 = tl.sum(b_lo << shifts4)
+                b_aux1 = tl.sum(b_hi << shifts4)
 
                 ls_a = (2 * (a_aux1 >> 28) + 1).to(tl.int32)
                 ls_b = (2 * (b_aux1 >> 28) + 1).to(tl.int32)
 
-                sub_sum_a = tl.zeros((), dtype=tl.int32)
-                sub_sum_b = tl.zeros((), dtype=tl.int32)
-                # 4 quads per sub-block, 8 quants per quad, 32 quants total.
-                # Use static_range so loop unrolls into Triton IR.
-                # Each quad: lookup 8 signed_grid values, dot with q8 chunk.
+                # Vector-decode 4 (grid_idx, sign_idx) pairs per sub-block.
+                shift8 = quad * 8                # (4,)
+                shift7 = quad * 7
+                grid_idx_a = (a_aux0 >> shift8) & 0xFF      # (4,)
+                grid_idx_b = (b_aux0 >> shift8) & 0xFF
+                sign_idx_a = (a_aux1 >> shift7) & 0x7F
+                sign_idx_b = (b_aux1 >> shift7) & 0x7F
+
+                # 4 LUT base addresses (one per quad).
+                base_a = (grid_idx_a * 128 + sign_idx_a) * 8     # (4,)
+                base_b = (grid_idx_b * 128 + sign_idx_b) * 8
+
+                # Vectorized LUT load: (4, 8) signed_grid values per row.
+                # Reshape to (32,) so the dot uses the full sub-block width.
+                sg_a = tl.load(
+                    signed_grid_ptr + base_a[:, None] + j[None, :]
+                ).to(tl.int32)                                    # (4, 8)
+                sg_b = tl.load(
+                    signed_grid_ptr + base_b[:, None] + j[None, :]
+                ).to(tl.int32)
+
+                # Load full 32-element activation chunk for this sub-block.
                 q8_base = blk * BLOCK + sub * SUB_SIZE
-                for quad in tl.static_range(0, 4):
-                    grid_idx_a = (a_aux0 >> (8 * quad)) & 0xFF
-                    grid_idx_b = (b_aux0 >> (8 * quad)) & 0xFF
-                    sign_idx_a = (a_aux1 >> (7 * quad)) & 0x7F
-                    sign_idx_b = (b_aux1 >> (7 * quad)) & 0x7F
+                q8_chunk = tl.load(
+                    q8_qs_tok + q8_base + quants_in_sub
+                ).to(tl.int32)                                    # (4, 8)
 
-                    # signed_grid[grid_idx, sign_idx] is 8 int8 values.
-                    base_a = (grid_idx_a * 128 + sign_idx_a) * 8
-                    base_b = (grid_idx_b * 128 + sign_idx_b) * 8
-                    j = tl.arange(0, 8)
-                    sg_a = tl.load(signed_grid_ptr + base_a + j).to(tl.int32)
-                    sg_b = tl.load(signed_grid_ptr + base_b + j).to(tl.int32)
+                # Single 32-element dot per sub-block (vs 4 separate
+                # 8-element dots in the v1 kernel). Triton compiles this
+                # to a 32-lane reduction.
+                sub_sum_a = tl.sum(sg_a * q8_chunk)
+                sub_sum_b = tl.sum(sg_b * q8_chunk)
 
-                    q8_chunk = tl.load(
-                        q8_qs_tok + q8_base + quad * 8 + j
-                    ).to(tl.int32)
-
-                    sub_sum_a += tl.sum(sg_a * q8_chunk, axis=0)
-                    sub_sum_b += tl.sum(sg_b * q8_chunk, axis=0)
-
-                # Block-level: bsum += sub_sum * ls
-                # Promote to float32 for mixed accumulation.
-                d_q8 = tl.load(q8_d_tok + blk).to(tl.float32)
-                d_a = tl.load(w_a_d_row + blk).to(tl.float32)
-                d_b = tl.load(w_b_d_row + blk).to(tl.float32)
-
-                # Scaled per-sub-block contribution: ls * sub_sum.
-                # We accumulate in float to avoid 32-bit overflow in long
-                # rows; ds4's bsum stays in int32 because n_blocks is small
-                # (one row of one expert), but float matches the final
-                # numerical result up to FMA ordering.
                 sum_a += d_a * d_q8 * (ls_a * sub_sum_a).to(tl.float32)
                 sum_b += d_b * d_q8 * (ls_b * sub_sum_b).to(tl.float32)
 
