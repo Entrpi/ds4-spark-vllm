@@ -13,17 +13,19 @@ naming):
 
 Where ``n_blocks_in = hidden / 256`` and ``n_blocks_int = intermediate / 256``.
 
-The forward (``apply``) does, per token:
+The forward (``apply``) groups tokens by selected expert and dispatches
+one batched Triton call per active expert:
 
-    1. Quantize the activation x to Q8_K  (uses :func:`quantize_q8_K_triton`)
-    2. For each selected expert e:
-         a. Compute mid = silu(gate_e . x_q) * (up_e . x_q)
-            via :func:`iq2_xxs_pair_dot_triton` (one call per expert, two
-            outputs per row)
-         b. Quantize mid to Q8_K
-    3. For each output row r of the down projection:
-         out[r] = sum_e (down_e[r] . mid_q[e])
-         via :func:`q2_K_accum_dot_triton`
+    1. Quantize all T token activations to Q8_K in one batched launch.
+    2. argsort tokens by expert id, build per-expert offset table via
+       bincount + cumsum (single ``.cpu()`` sync per layer).
+    3. For each expert e with M_e routed tokens:
+         a. gate_out, up_out = iq2_xxs_pair_dot_triton(W13[e], x_q[tokens_e])
+            -- shape (M_e, intermediate)
+         b. mid = silu(gate_out) * up_out, quantized to Q8_K
+         c. down_out = q2_K_accum_dot_triton(W2[e], mid_q)
+            -- shape (M_e, hidden)
+         d. out.index_add_(tokens_e, down_out * topk_weights_e)
 """
 
 from __future__ import annotations
@@ -201,12 +203,19 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
         topk_ids: "torch.Tensor",                  # (T, top_k)
         shared_experts_input: "torch.Tensor | None",
     ) -> "torch.Tensor":
-        """Run the IQ2_XXS+Q2_K MoE forward.
+        """Run the IQ2_XXS+Q2_K MoE forward with batched per-expert dispatch.
 
-        For the first cut we materialize per-token-per-expert work via
-        Python loops over selected experts; this is correct but slow.
-        Performance tuning (one fused launch per layer) is a v2 task
-        once correctness is validated against ds4 logits.
+        Strategy: argsort tokens by selected expert id, dispatch one
+        batched Triton call per active expert, scatter results back via
+        ``index_add_``. One ``.cpu().tolist()`` sync per layer (on the
+        n_experts-sized offset table) is the only host round-trip,
+        replacing the previous per-token ``int(topk_ids[t,k].item())``
+        sync inside an inner loop.
+
+        ``shared_experts_input`` is intentionally ignored — vLLM's
+        ``MoeRunner`` handles shared experts independently and adds
+        their output to the value we return (see
+        ``moe_runner.py:679``).
         """
         from ..triton_kernels.q8_K_quantize import quantize_q8_K_triton
         from ..triton_kernels.iq2_xxs_pair_dot import iq2_xxs_pair_dot_triton
@@ -312,48 +321,71 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 )
             except Exception as _e:
                 print(f"[DS4_ROUTE] error: {_e!r}", flush=True)
-        # Quantize all token activations in one shot.
+        # Quantize all token activations in one shot — already batched.
         x_blocks = x.reshape(T * n_blocks_in, QK_K).to(torch.float32)
-        x_q_qs, x_q_d, x_q_bsums = quantize_q8_K_triton(x_blocks)
+        x_q_qs, x_q_d, _x_q_bsums_unused = quantize_q8_K_triton(x_blocks)
         x_q_qs = x_q_qs.reshape(T, n_blocks_in, QK_K)
         x_q_d = x_q_d.reshape(T, n_blocks_in)
-        x_q_bsums = x_q_bsums.reshape(T, n_blocks_in, 16)
 
-        for t in range(T):
-            for k in range(top_k):
-                expert = int(topk_ids[t, k].item())
-                weight = topk_weights[t, k]
+        # Build per-expert dispatch table. All GPU until the single
+        # offsets.cpu() sync below.
+        flat_ids = topk_ids.reshape(-1).to(torch.int64)        # (T*top_k,)
+        flat_weights = topk_weights.reshape(-1)                # (T*top_k,)
+        sort_order = flat_ids.argsort()
+        sorted_eids = flat_ids[sort_order]
+        sorted_tids = sort_order // top_k                      # (T*top_k,) token idx per slot
+        sorted_w = flat_weights[sort_order]
 
-                # Gate / up: w13 is laid out as [n_experts, gate_rows | up_rows, ...]
-                gate_qs = layer.w13_iq2xxs_qs[expert, :intermediate]
-                gate_d = layer.w13_iq2xxs_d[expert, :intermediate]
-                up_qs = layer.w13_iq2xxs_qs[expert, intermediate:]
-                up_d = layer.w13_iq2xxs_d[expert, intermediate:]
+        counts = torch.bincount(sorted_eids, minlength=n_experts)
+        offsets = torch.cat([counts.new_zeros(1), counts.cumsum(0)])
+        # ONE sync per layer on a (n_experts+1,) tensor (~257 ints).
+        # Matches the pattern in vllm/.../cpu_fused_moe.py:440-476.
+        offsets_h = offsets.cpu().tolist()
 
-                gate_out, up_out = iq2_xxs_pair_dot_triton(
-                    gate_qs, gate_d, up_qs, up_d,
-                    x_q_qs[t], x_q_d[t],
-                )
+        for e in range(n_experts):
+            s = offsets_h[e]
+            t_end = offsets_h[e + 1]
+            M_e = t_end - s
+            if M_e == 0:
+                continue
 
-                # SwiGLU: silu(gate) * up.
-                mid = torch.nn.functional.silu(gate_out) * up_out
+            tokens_e = sorted_tids[s:t_end]                    # (M_e,) GPU slice
+            weights_e = sorted_w[s:t_end]                      # (M_e,)
 
-                # Quantize mid to Q8_K.
-                mid_blocks = mid.reshape(n_blocks_int, QK_K).to(torch.float32)
-                mid_qs, mid_d, mid_bsums = quantize_q8_K_triton(mid_blocks)
+            # Gather this expert's M_e activations (contiguous copy).
+            x_q_qs_e = x_q_qs[tokens_e].contiguous()           # (M_e, n_blocks_in, QK_K)
+            x_q_d_e = x_q_d[tokens_e].contiguous()             # (M_e, n_blocks_in)
 
-                # Down projection (single expert via accum kernel with n_experts=1).
-                w_scales = layer.w2_q2k_scales[expert].unsqueeze(0)
-                w_qs = layer.w2_q2k_qs[expert].unsqueeze(0)
-                w_d = layer.w2_q2k_d[expert].unsqueeze(0)
-                w_dmin = layer.w2_q2k_dmin[expert].unsqueeze(0)
+            # Gate / up: w13 is laid out as [n_experts, gate_rows | up_rows, ...]
+            gate_qs = layer.w13_iq2xxs_qs[e, :intermediate]
+            gate_d = layer.w13_iq2xxs_d[e, :intermediate]
+            up_qs = layer.w13_iq2xxs_qs[e, intermediate:]
+            up_d = layer.w13_iq2xxs_d[e, intermediate:]
 
-                down_out = q2_K_accum_dot_triton(
-                    w_scales, w_qs, w_d, w_dmin,
-                    mid_qs.unsqueeze(0), mid_d.unsqueeze(0),
-                    mid_bsums.unsqueeze(0),
-                )
-                out[t].add_(down_out.to(x.dtype) * weight)
+            gate_out, up_out = iq2_xxs_pair_dot_triton(
+                gate_qs, gate_d, up_qs, up_d,
+                x_q_qs_e, x_q_d_e,
+            )                                                   # each (M_e, intermediate)
+
+            # SwiGLU: silu(gate) * up.
+            mid = torch.nn.functional.silu(gate_out) * up_out   # (M_e, intermediate)
+
+            # Quantize mid to Q8_K — flatten M dim into the block dim.
+            mid_blocks = mid.reshape(M_e * n_blocks_int, QK_K).to(torch.float32)
+            mid_qs, mid_d, mid_bsums = quantize_q8_K_triton(mid_blocks)
+            mid_qs = mid_qs.reshape(M_e, n_blocks_int, QK_K)
+            mid_d = mid_d.reshape(M_e, n_blocks_int)
+            mid_bsums = mid_bsums.reshape(M_e, n_blocks_int, 16)
+
+            # Down projection — single expert × M_e tokens.
+            down_out = q2_K_accum_dot_triton(
+                layer.w2_q2k_scales[e], layer.w2_q2k_qs[e],
+                layer.w2_q2k_d[e],      layer.w2_q2k_dmin[e],
+                mid_qs, mid_d, mid_bsums,
+            )                                                   # (M_e, hidden)
+
+            weighted = down_out.to(x.dtype) * weights_e.unsqueeze(1)
+            out.index_add_(0, tokens_e, weighted)
 
         # DS4_HDUMP: hidden-state dump for layer-by-layer comparison vs ds4
         # reference. Gated by /logs/ds4_dump_arm so it only fires during a

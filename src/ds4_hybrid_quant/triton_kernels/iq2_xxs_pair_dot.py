@@ -134,38 +134,47 @@ if HAVE_TRITON:
 
     @triton.jit
     def _iq2_xxs_pair_dot_kernel(
-        # Weight (n_rows, n_blocks, *) -- contiguous on (block, byte) axis
+        # Weight (n_rows, n_blocks, *) -- shared across all M tokens that
+        # routed to this expert.
         w_a_qs_ptr,    # *uint8,   (n_rows, n_blocks, 64)
         w_a_d_ptr,     # *float16, (n_rows, n_blocks)
         w_b_qs_ptr,    # *uint8
         w_b_d_ptr,     # *float16
-        # Activation (n_blocks_per_token, *) -- one token's blocks
-        q8_qs_ptr,     # *int8,    (n_blocks, 256)
-        q8_d_ptr,      # *float32, (n_blocks,)
-        # Output (n_rows,) for each of A and B
-        out_a_ptr,     # *float32, (n_rows,)
-        out_b_ptr,     # *float32, (n_rows,)
+        # Activation (M, n_blocks, *) -- M tokens' Q8 blocks.
+        q8_qs_ptr,     # *int8,    (M, n_blocks, 256)
+        q8_d_ptr,      # *float32, (M, n_blocks)
+        # Output (M, n_rows) for each of A and B.
+        out_a_ptr,     # *float32, (M, n_rows)
+        out_b_ptr,     # *float32, (M, n_rows)
         # Lookup
         signed_grid_ptr,  # *int8, (256, 128, 8)
-        # Sizes
+        # Sizes / strides (runtime — M and n_rows vary per call).
         n_blocks,
+        stride_q8_qs_m,    # = n_blocks * 256
+        stride_q8_d_m,     # = n_blocks
+        stride_out_m,      # = n_rows
         BLOCK: tl.constexpr,         # = 256 (QK_K)
         N_SUB: tl.constexpr,         # = 8
         SUB_SIZE: tl.constexpr,      # = 32
     ):
-        """One program computes the two outputs for one row index.
+        """One program computes the two outputs for one (token, row).
 
-        Iterates over all ``n_blocks`` blocks for that row, accumulating
-        the gate (A) and up (B) sums. The Q8 activation read at each
-        block is shared between A and B.
+        Grid is ``(M, n_rows)``. All M programs sharing a row_id read
+        identical weight bytes — automatic L2 reuse on the weight tensor.
+        Q8 activation is per-token (offset by ``m_id * stride_q8_*_m``).
         """
-        row_id = tl.program_id(0)
+        m_id = tl.program_id(0)
+        row_id = tl.program_id(1)
 
-        # Per-row weight pointers.
+        # Per-row weight pointers (shared across M).
         w_a_qs_row = w_a_qs_ptr + row_id * n_blocks * 64
         w_a_d_row = w_a_d_ptr + row_id * n_blocks
         w_b_qs_row = w_b_qs_ptr + row_id * n_blocks * 64
         w_b_d_row = w_b_d_ptr + row_id * n_blocks
+
+        # Per-token activation pointers.
+        q8_qs_tok = q8_qs_ptr + m_id * stride_q8_qs_m
+        q8_d_tok = q8_d_ptr + m_id * stride_q8_d_m
 
         sum_a = 0.0
         sum_b = 0.0
@@ -242,7 +251,7 @@ if HAVE_TRITON:
                     sg_b = tl.load(signed_grid_ptr + base_b + j).to(tl.int32)
 
                     q8_chunk = tl.load(
-                        q8_qs_ptr + q8_base + quad * 8 + j
+                        q8_qs_tok + q8_base + quad * 8 + j
                     ).to(tl.int32)
 
                     sub_sum_a += tl.sum(sg_a * q8_chunk, axis=0)
@@ -250,7 +259,7 @@ if HAVE_TRITON:
 
                 # Block-level: bsum += sub_sum * ls
                 # Promote to float32 for mixed accumulation.
-                d_q8 = tl.load(q8_d_ptr + blk).to(tl.float32)
+                d_q8 = tl.load(q8_d_tok + blk).to(tl.float32)
                 d_a = tl.load(w_a_d_row + blk).to(tl.float32)
                 d_b = tl.load(w_b_d_row + blk).to(tl.float32)
 
@@ -262,35 +271,54 @@ if HAVE_TRITON:
                 sum_a += d_a * d_q8 * (ls_a * sub_sum_a).to(tl.float32)
                 sum_b += d_b * d_q8 * (ls_b * sub_sum_b).to(tl.float32)
 
-        tl.store(out_a_ptr + row_id, 0.125 * sum_a)
-        tl.store(out_b_ptr + row_id, 0.125 * sum_b)
+        tl.store(out_a_ptr + m_id * stride_out_m + row_id, 0.125 * sum_a)
+        tl.store(out_b_ptr + m_id * stride_out_m + row_id, 0.125 * sum_b)
 
 
     def iq2_xxs_pair_dot_triton(
         w_a_qs, w_a_d,    # uint8 (n_rows, n_blocks, 64), float16 (n_rows, n_blocks)
         w_b_qs, w_b_d,
-        q8_qs, q8_d,      # int8 (n_blocks, 256), float32 (n_blocks,)
+        q8_qs, q8_d,      # int8 (M, n_blocks, 256), float32 (M, n_blocks)
     ):
-        """Run the pair-dot Triton kernel. Returns (out_a, out_b) on the same
-        device as the inputs."""
+        """Run the batched pair-dot Triton kernel.
+
+        ``q8_qs`` / ``q8_d`` carry an outer M (token-batch) dim. Outputs
+        have shape ``(M, n_rows)``. M=1 is allowed (caller passes
+        unsqueezed tensors).
+        """
         import torch
 
         n_rows = w_a_qs.shape[0]
         n_blocks = w_a_qs.shape[1]
+        if q8_qs.ndim != 3 or q8_d.ndim != 2:
+            raise ValueError(
+                f"q8_qs must be (M, n_blocks, 256) and q8_d (M, n_blocks); "
+                f"got q8_qs.shape={tuple(q8_qs.shape)} q8_d.shape={tuple(q8_d.shape)}"
+            )
+        M = q8_qs.shape[0]
+        if q8_d.shape[0] != M:
+            raise ValueError("q8_qs and q8_d must agree on M")
 
-        out_a = torch.empty((n_rows,), dtype=torch.float32, device=w_a_qs.device)
-        out_b = torch.empty((n_rows,), dtype=torch.float32, device=w_a_qs.device)
+        out_a = torch.empty((M, n_rows), dtype=torch.float32, device=w_a_qs.device)
+        out_b = torch.empty((M, n_rows), dtype=torch.float32, device=w_a_qs.device)
 
         signed_grid_t = torch.from_numpy(SIGNED_GRID).to(w_a_qs.device).contiguous()
 
-        grid = (n_rows,)
+        q8_qs_c = q8_qs.contiguous()
+        q8_d_c = q8_d.contiguous()
+        stride_q8_qs_m = n_blocks * QK_K
+        stride_q8_d_m = n_blocks
+        stride_out_m = n_rows
+
+        grid = (M, n_rows)
         _iq2_xxs_pair_dot_kernel[grid](
             w_a_qs.contiguous(), w_a_d.contiguous(),
             w_b_qs.contiguous(), w_b_d.contiguous(),
-            q8_qs.contiguous(), q8_d.contiguous(),
+            q8_qs_c, q8_d_c,
             out_a, out_b,
             signed_grid_t,
             n_blocks,
+            stride_q8_qs_m, stride_q8_d_m, stride_out_m,
             BLOCK=QK_K, N_SUB=8, SUB_SIZE=32,
         )
         return out_a, out_b

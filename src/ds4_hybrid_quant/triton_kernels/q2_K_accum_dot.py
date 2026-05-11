@@ -1,14 +1,14 @@
-"""Q2_K accumulated dot product kernel.
+"""Q2_K batched dot product kernel.
 
-Computes one output row of the routed-expert down projection:
+Computes the down projection for one expert across M tokens:
 
-    out[r] = sum over selected experts e of
-                Q2_K_row[e, r] dot Q8_K_activation[e]
+    out[m, r] = Q2_K_row[r] dot Q8_K_activation[m]
 
-Each expert provides its own quantized Q2_K weight row (the routed-expert
-``w2`` parameter for that expert) and its own Q8_K-quantized post-SwiGLU
-midq activation. The output row has no per-expert weighting beyond what
-the SwiGLU step already applied — the experts simply add.
+The kernel takes a single expert's weights ``(n_rows, n_blocks, ...)``
+plus M tokens' Q8_K-quantized post-SwiGLU activations
+``(M, n_blocks, ...)`` and produces ``(M, n_rows)`` outputs. No
+per-token or per-expert weighting is applied here — caller multiplies
+by ``topk_weights`` and scatter-adds back to the output buffer.
 
 Per-block algorithm (matches ds4_vec_dot_q2_K_q8_K scalar, ds4.c:1593):
 
@@ -119,109 +119,144 @@ if HAVE_TRITON:
 
     @triton.jit
     def _q2_K_accum_dot_kernel(
-        # Weight (n_experts, n_rows, n_blocks, ...)  -- packed per expert
-        w_scales_ptr,   # *uint8,   (n_experts, n_rows, n_blocks, 16)
-        w_qs_ptr,       # *uint8,   (n_experts, n_rows, n_blocks, 64)
-        w_d_ptr,        # *float16, (n_experts, n_rows, n_blocks)
-        w_dmin_ptr,     # *float16, (n_experts, n_rows, n_blocks)
-        # Activation per expert
-        q8_qs_ptr,      # *int8,    (n_experts, n_blocks, 256)
-        q8_d_ptr,       # *float32, (n_experts, n_blocks)
-        q8_bsums_ptr,   # *int16,   (n_experts, n_blocks, 16)
-        # Output (n_rows,)
-        out_ptr,        # *float32, (n_rows,)
-        n_experts,
+        # Weight (n_rows, n_blocks, ...) -- single expert.
+        w_scales_ptr,   # *uint8,   (n_rows, n_blocks, 16)
+        w_qs_ptr,       # *uint8,   (n_rows, n_blocks, 64)
+        w_d_ptr,        # *float16, (n_rows, n_blocks)
+        w_dmin_ptr,     # *float16, (n_rows, n_blocks)
+        # Activation (M, n_blocks, ...) -- M tokens routed to this expert.
+        q8_qs_ptr,      # *int8,    (M, n_blocks, 256)
+        q8_d_ptr,       # *float32, (M, n_blocks)
+        q8_bsums_ptr,   # *int16,   (M, n_blocks, 16)
+        # Output (M, n_rows)
+        out_ptr,        # *float32, (M, n_rows)
         n_rows,
         n_blocks,
+        stride_q8_qs_m,    # = n_blocks * 256
+        stride_q8_d_m,     # = n_blocks
+        stride_q8_bsums_m, # = n_blocks * 16
+        stride_out_m,      # = n_rows
         BLOCK: tl.constexpr,    # = 256
         N_SCALES: tl.constexpr,  # = 16
     ):
-        """One program produces one output row by summing across experts."""
-        row_id = tl.program_id(0)
+        """One program produces one ``out[m, r]`` value.
+
+        Grid is ``(M, n_rows)``. All M programs sharing a row_id read
+        identical weight bytes — automatic L2 reuse on the weight tensor.
+        """
+        m_id = tl.program_id(0)
+        row_id = tl.program_id(1)
+
+        # Per-row weight base addresses (shared across M).
+        w_scales_row = w_scales_ptr + row_id * n_blocks * 16
+        w_qs_row = w_qs_ptr + row_id * n_blocks * 64
+        w_d_row = w_d_ptr + row_id * n_blocks
+        w_dmin_row = w_dmin_ptr + row_id * n_blocks
+        # Per-token q8 base addresses.
+        q8_qs_tok = q8_qs_ptr + m_id * stride_q8_qs_m
+        q8_d_tok = q8_d_ptr + m_id * stride_q8_d_m
+        q8_bsums_tok = q8_bsums_ptr + m_id * stride_q8_bsums_m
 
         acc = tl.zeros((), dtype=tl.float32)
 
-        for e in range(0, n_experts):
-            # Per-(expert, row) base addresses.
-            w_base_blk = e * n_rows * n_blocks
-            w_scales_row = w_scales_ptr + (w_base_blk + row_id * n_blocks) * 16
-            w_qs_row = w_qs_ptr + (w_base_blk + row_id * n_blocks) * 64
-            w_d_row = w_d_ptr + w_base_blk + row_id * n_blocks
-            w_dmin_row = w_dmin_ptr + w_base_blk + row_id * n_blocks
-            q8_blk = e * n_blocks
+        for blk in range(0, n_blocks):
+            # Load q8 bsums[16] and reduce summs.
+            scale_offs = tl.arange(0, N_SCALES)
+            scales = tl.load(w_scales_row + blk * 16 + scale_offs)
+            scale_hi = (scales >> 4).to(tl.int32)
+            bsums = tl.load(
+                q8_bsums_tok + blk * 16 + scale_offs
+            ).to(tl.int32)
+            summs = tl.sum(bsums * scale_hi, axis=0)
 
-            for blk in range(0, n_blocks):
-                # Load q8 bsums[16] and reduce summs.
-                scale_offs = tl.arange(0, N_SCALES)
-                scales = tl.load(w_scales_row + blk * 16 + scale_offs)
-                scale_hi = (scales >> 4).to(tl.int32)
-                bsums = tl.load(
-                    q8_bsums_ptr + (q8_blk + blk) * 16 + scale_offs
-                ).to(tl.int32)
-                summs = tl.sum(bsums * scale_hi, axis=0)
+            # Per-block isum: 2 outer * 4 shifts * 2 halves = 16 dot pieces.
+            # Each piece is a 16-element int dot. We load each scale_lo
+            # nibble directly from memory via offset (Triton tensors
+            # don't support Python-int subscripting inside @jit).
+            isum = tl.zeros((), dtype=tl.int32)
+            is_idx = 0
+            j16 = tl.arange(0, 16)
+            for k in tl.static_range(0, 2):  # QK_K/128
+                base_q2 = blk * 64 + k * 32
+                base_q8 = blk * BLOCK + k * 128
+                for j in tl.static_range(0, 4):  # shift index
+                    shift = 2 * j
+                    # lo16
+                    sc_lo = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
+                    q2_lo = ((tl.load(w_qs_row + base_q2 + j16) >> shift) & 0x03).to(tl.int32)
+                    q8_lo = tl.load(q8_qs_tok + base_q8 + j * 32 + j16).to(tl.int32)
+                    s_lo = tl.sum(q2_lo * q8_lo, axis=0)
+                    isum = isum + sc_lo * s_lo
+                    is_idx += 1
 
-                # Per-block isum: 2 outer * 4 shifts * 2 halves = 16 dot pieces.
-                # Each piece is a 16-element int dot. We load each scale_lo
-                # nibble directly from memory via offset (Triton tensors
-                # don't support Python-int subscripting inside @jit).
-                isum = tl.zeros((), dtype=tl.int32)
-                is_idx = 0
-                j16 = tl.arange(0, 16)
-                for k in tl.static_range(0, 2):  # QK_K/128
-                    base_q2 = blk * 64 + k * 32
-                    base_q8 = (q8_blk + blk) * BLOCK + k * 128
-                    for j in tl.static_range(0, 4):  # shift index
-                        shift = 2 * j
-                        # lo16
-                        sc_lo = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
-                        q2_lo = ((tl.load(w_qs_row + base_q2 + j16) >> shift) & 0x03).to(tl.int32)
-                        q8_lo = tl.load(q8_qs_ptr + base_q8 + j * 32 + j16).to(tl.int32)
-                        s_lo = tl.sum(q2_lo * q8_lo, axis=0)
-                        isum = isum + sc_lo * s_lo
-                        is_idx += 1
+                    # hi16
+                    sc_hi = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
+                    q2_hi = ((tl.load(w_qs_row + base_q2 + 16 + j16) >> shift) & 0x03).to(tl.int32)
+                    q8_hi = tl.load(q8_qs_tok + base_q8 + j * 32 + 16 + j16).to(tl.int32)
+                    s_hi = tl.sum(q2_hi * q8_hi, axis=0)
+                    isum = isum + sc_hi * s_hi
+                    is_idx += 1
 
-                        # hi16
-                        sc_hi = (tl.load(w_scales_row + blk * 16 + is_idx) & 0x0F).to(tl.int32)
-                        q2_hi = ((tl.load(w_qs_row + base_q2 + 16 + j16) >> shift) & 0x03).to(tl.int32)
-                        q8_hi = tl.load(q8_qs_ptr + base_q8 + j * 32 + 16 + j16).to(tl.int32)
-                        s_hi = tl.sum(q2_hi * q8_hi, axis=0)
-                        isum = isum + sc_hi * s_hi
-                        is_idx += 1
+            d_blk = tl.load(w_d_row + blk).to(tl.float32)
+            dmin_blk = tl.load(w_dmin_row + blk).to(tl.float32)
+            d_q8 = tl.load(q8_d_tok + blk).to(tl.float32)
 
-                d_blk = tl.load(w_d_row + blk).to(tl.float32)
-                dmin_blk = tl.load(w_dmin_row + blk).to(tl.float32)
-                d_q8 = tl.load(q8_d_ptr + q8_blk + blk).to(tl.float32)
+            acc += d_q8 * d_blk * isum.to(tl.float32) - d_q8 * dmin_blk * summs.to(tl.float32)
 
-                acc += d_q8 * d_blk * isum.to(tl.float32) - d_q8 * dmin_blk * summs.to(tl.float32)
-
-        tl.store(out_ptr + row_id, acc)
+        tl.store(out_ptr + m_id * stride_out_m + row_id, acc)
 
 
     def q2_K_accum_dot_triton(
         w_scales, w_qs, w_d, w_dmin,
         q8_qs, q8_d, q8_bsums,
     ):
-        """Run the Q2_K accumulated dot kernel.
+        """Run the batched Q2_K dot kernel for one expert × M tokens.
 
         Shapes:
-            w_scales : (n_experts, n_rows, n_blocks, 16) uint8
-            w_qs     : (n_experts, n_rows, n_blocks, 64) uint8
-            w_d      : (n_experts, n_rows, n_blocks)     float16
-            w_dmin   : (n_experts, n_rows, n_blocks)     float16
-            q8_qs    : (n_experts, n_blocks, 256)        int8
-            q8_d     : (n_experts, n_blocks)             float32
-            q8_bsums : (n_experts, n_blocks, 16)         int16
+            w_scales : (n_rows, n_blocks, 16) uint8
+            w_qs     : (n_rows, n_blocks, 64) uint8
+            w_d      : (n_rows, n_blocks)     float16
+            w_dmin   : (n_rows, n_blocks)     float16
+            q8_qs    : (M, n_blocks, 256)     int8
+            q8_d     : (M, n_blocks)          float32
+            q8_bsums : (M, n_blocks, 16)      int16
+
+        Returns:
+            out : (M, n_rows) float32
         """
         import torch
 
-        n_experts, n_rows, n_blocks = w_d.shape
-        out = torch.empty((n_rows,), dtype=torch.float32, device=w_qs.device)
-        grid = (n_rows,)
+        n_rows, n_blocks = w_d.shape
+        if q8_qs.ndim != 3 or q8_d.ndim != 2 or q8_bsums.ndim != 3:
+            raise ValueError(
+                f"q8_qs must be (M, n_blocks, 256), q8_d (M, n_blocks), "
+                f"q8_bsums (M, n_blocks, 16); got "
+                f"q8_qs.shape={tuple(q8_qs.shape)} "
+                f"q8_d.shape={tuple(q8_d.shape)} "
+                f"q8_bsums.shape={tuple(q8_bsums.shape)}"
+            )
+        M = q8_qs.shape[0]
+        if q8_d.shape[0] != M or q8_bsums.shape[0] != M:
+            raise ValueError("q8 inputs must agree on M")
+
+        out = torch.empty((M, n_rows), dtype=torch.float32, device=w_qs.device)
+
+        q8_qs_c = q8_qs.contiguous()
+        q8_d_c = q8_d.contiguous()
+        q8_bsums_c = q8_bsums.contiguous()
+        stride_q8_qs_m = n_blocks * QK_K
+        stride_q8_d_m = n_blocks
+        stride_q8_bsums_m = n_blocks * 16
+        stride_out_m = n_rows
+
+        grid = (M, n_rows)
         _q2_K_accum_dot_kernel[grid](
-            w_scales.contiguous(), w_qs.contiguous(), w_d.contiguous(), w_dmin.contiguous(),
-            q8_qs.contiguous(), q8_d.contiguous(), q8_bsums.contiguous(),
+            w_scales.contiguous(), w_qs.contiguous(),
+            w_d.contiguous(), w_dmin.contiguous(),
+            q8_qs_c, q8_d_c, q8_bsums_c,
             out,
-            n_experts, n_rows, n_blocks,
+            n_rows, n_blocks,
+            stride_q8_qs_m, stride_q8_d_m, stride_q8_bsums_m, stride_out_m,
             BLOCK=QK_K, N_SCALES=16,
         )
         return out
