@@ -159,30 +159,10 @@ def complete_load(
     import os
     from safetensors import safe_open
 
-    # DS4_LOAD_COMP_DBG: identify which model instance this is — if there
-    # are two calls and id(params_dict) differs, it's the MTP head's mirror
-    # instance, not the main model being re-processed.
-    print(
-        f"[DS4_LOAD_COMP_DBG] enter id(params_dict)={id(params_dict)} "
-        f"params={len(params_dict)} loaded={len(loaded_params)}",
-        flush=True,
-    )
-
     unloaded = [k for k in params_dict if k not in loaded_params]
     if not unloaded:
         print("[DS4_LOAD_COMP] nothing to do (all params loaded)", flush=True)
         return
-
-    # DS4_LOAD_COMP_DBG: print first few unloaded names so we can see live
-    # parameter naming (e.g. whether `layers.K.X` or `model.layers.K.X`).
-    # Helps verify that remap rule suffix-matching will work.
-    sample_unloaded = sorted(unloaded)[:8]
-    print(f"[DS4_LOAD_COMP_DBG] sample unloaded ({len(unloaded)} total): "
-          f"{sample_unloaded}", flush=True)
-    norm_unloaded = [k for k in unloaded if "norm.weight" in k]
-    print(f"[DS4_LOAD_COMP_DBG] norm-weight unloaded count: "
-          f"{len(norm_unloaded)} (sample: {sorted(norm_unloaded)[:5]})",
-          flush=True)
 
     # CHANGED 2026-05-10: reordered phases. Previously Phase 1 was
     # default-init (which would default norm weights to 1.0 BEFORE any
@@ -315,61 +295,3 @@ def complete_load(
     final_unloaded = [k for k in params_dict if k not in loaded_params]
     print(f"[DS4_LOAD_COMP] final unloaded count: {len(final_unloaded)}",
           flush=True)
-
-    # DS4_FUSION_DBG: compare first-half vs second-half magnitude of
-    # fused_wqa_wkv.weight for a standard-pipeline-loaded layer (0) vs a
-    # manually-loaded layer (37). If my cat order matches the standard
-    # pipeline, both should show the same pattern.
-    try:
-        for lid in (0, 5, 35, 37, 41):
-            k = f"layers.{lid}.attn.fused_wqa_wkv.weight"
-            if k not in params_dict:
-                continue
-            p = params_dict[k]
-            # fused = cat(wq_a:dim0=512, wkv:dim0=1024) along dim 0 → (1536, 4096)
-            # if param.dtype is fp8, view via float() for stats
-            ph = p.float() if not p.is_floating_point() or p.dtype not in (torch.float32, torch.float16, torch.bfloat16) else p
-            try:
-                first_half = ph[:512].abs()
-                second_half = ph[512:].abs()
-                fh_mean = float(first_half.mean().item())
-                sh_mean = float(second_half.mean().item())
-                print(f"[DS4_FUSION_DBG] layer {lid} fused_wqa_wkv: "
-                      f"first512_mean={fh_mean:.3e} last1024_mean={sh_mean:.3e}",
-                      flush=True)
-            except Exception as e:
-                print(f"[DS4_FUSION_DBG] layer {lid}: stat error {e!r}", flush=True)
-    except Exception as e:
-        print(f"[DS4_FUSION_DBG] error: {e!r}", flush=True)
-
-    # also compare directly to safetensor data for one layer to verify identity.
-    try:
-        with torch.no_grad():
-            for lid in (0, 37):
-                fused_key = f"layers.{lid}.attn.fused_wqa_wkv.weight"
-                if fused_key not in params_dict:
-                    continue
-                wq_a_t = _get_tensor(f"layers.{lid}.attn.wq_a.weight")
-                wkv_t = _get_tensor(f"layers.{lid}.attn.wkv.weight")
-                if wq_a_t is None or wkv_t is None:
-                    continue
-                fp = params_dict[fused_key].float()
-                # standard convention: top of fused = wq_a, bottom = wkv
-                wq_a_top = fp[:wq_a_t.shape[0]]
-                wkv_bot = fp[wq_a_t.shape[0]:]
-                # diff vs safetensor (cast both to fp32 for comparison)
-                top_match = float((wq_a_top - wq_a_t.float()).abs().mean().item())
-                bot_match = float((wkv_bot - wkv_t.float()).abs().mean().item())
-                # if reversed
-                wkv_top = fp[:wkv_t.shape[0]]
-                wq_a_bot = fp[wkv_t.shape[0]:]
-                rev_top_match = float((wkv_top - wkv_t.float()).abs().mean().item())
-                rev_bot_match = float((wq_a_bot - wq_a_t.float()).abs().mean().item())
-                print(f"[DS4_FUSION_DBG] layer {lid} std-order diffs: "
-                      f"top_vs_wq_a={top_match:.3e} bot_vs_wkv={bot_match:.3e}",
-                      flush=True)
-                print(f"[DS4_FUSION_DBG] layer {lid} rev-order diffs: "
-                      f"top_vs_wkv={rev_top_match:.3e} bot_vs_wq_a={rev_bot_match:.3e}",
-                      flush=True)
-    except Exception as e:
-        print(f"[DS4_FUSION_DBG] safetensor compare error: {e!r}", flush=True)
