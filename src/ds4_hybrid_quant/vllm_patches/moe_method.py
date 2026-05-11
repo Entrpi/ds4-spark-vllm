@@ -384,7 +384,10 @@ class Iq2XxsQ2KFusedMoEMethod(FusedMoEMethodBase):
                 mid_qs, mid_d, mid_bsums,
             )                                                   # (M_e, hidden)
 
-            weighted = down_out.to(x.dtype) * weights_e.unsqueeze(1)
+            # Cast both factors to x.dtype so index_add_'s dtype check
+            # passes — and to match the original code's bf16-throughout
+            # accumulation precision.
+            weighted = down_out.to(x.dtype) * weights_e.to(x.dtype).unsqueeze(1)
             out.index_add_(0, tokens_e, weighted)
 
         # DS4_HDUMP: hidden-state dump for layer-by-layer comparison vs ds4
