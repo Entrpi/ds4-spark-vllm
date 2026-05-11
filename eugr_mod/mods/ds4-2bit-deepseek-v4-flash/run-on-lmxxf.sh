@@ -109,8 +109,17 @@ fi
 # Patch deepseek_v4.py load_weights to gracefully handle expert tensor names
 # that don't match the standard w1/w2/w3 mapping (we use w13_iq2xxs_qs etc).
 # This is OUR patch — not in lmxxf's image.
+#
+# As of Entrpi/vllm@kv-layout-on-jasl-c2d4811 commits 12b521848 + 632f753b5
+# both edits below live as proper commits in the fork. When the overlay is
+# active (default), the rsync delivers the patched deepseek_v4.py directly;
+# the heredoc then becomes redundant AND crashes because the `assert old in
+# s` patterns no longer match (overlay-delivered code is the post-patch
+# shape). The overlay-skip guard mirrors the V1/V2/V3 pattern below.
 DSV4_PY="$SITE_PACKAGES/vllm/model_executor/models/deepseek_v4.py"
-if ! grep -q "DS4_HYBRID_PATCH" "$DSV4_PY"; then
+if [ "$DS4_VLLM_OVERLAY" = "1" ]; then
+    echo "[ds4] deepseek_v4.py monkey-patch skipped — overlay supplies graceful fall-through + complete_load hook natively"
+elif ! grep -q "DS4_HYBRID_PATCH" "$DSV4_PY"; then
     echo "[ds4] Patching $DSV4_PY load_weights for unrecognized expert tensors"
     python3 - <<PY
 import re
